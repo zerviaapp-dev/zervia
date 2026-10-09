@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+@theme {
+  /* Zervia brand blue scale — blue-and-white identity. */
+  --color-brand-50: #eef5ff;
+  --color-brand-100: #d9e8ff;
+  --color-brand-200: #b3d1ff;
+  --color-brand-300: #80b3ff;
+  --color-brand-400: #4d8dff;
+  --color-brand-500: #2470f2;
+  --color-brand-600: #0b5bd3;
+  --color-brand-700: #0a4aa8;
+  --color-brand-800: #0d3c83;
+  --color-brand-900: #0e2f61;
+  --color-brand-950: #0a1f42;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: #ffffff;
+  color: #0f172a; /* slate-900 */
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Shared auth input: 56px tap target, brand focus ring, senior-friendly. */
+.auth-input {
+  min-height: 56px;
+  width: 100%;
+  border-radius: 1rem;
+  border: 2px solid var(--color-brand-100);
+  background-color: #ffffff;
+  padding: 0.75rem 1.25rem;
+  font-size: 1.125rem;
+  color: var(--color-brand-900);
+}
+.auth-input::placeholder {
+  color: #94a3b8; /* slate-400 */
+}
+.auth-input:focus {
+  outline: none;
+  border-color: var(--color-brand-600);
+  box-shadow: 0 0 0 3px var(--color-brand-100);
+}
