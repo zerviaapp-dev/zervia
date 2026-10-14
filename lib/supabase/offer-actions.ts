@@ -4,7 +4,6 @@ import { getTranslations } from 'next-intl/server';
 import { createClient } from './server';
 import type { ActionResult } from './actions';
 
-export type { ActionResult };
 
 export type OfferRow = {
   id: string;
