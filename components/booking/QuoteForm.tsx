@@ -1,7 +1,8 @@
 'use client';
 
-import { useActionState, useEffect, useState } from 'react';
+import { useActionState, useEffect, useRef, useState } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
+import { toast } from 'sonner';
 import { sendQuote } from '@/lib/supabase/quote-actions';
 import type { ActionResult } from '@/lib/supabase/actions';
 import { Panel } from '@/components/Panel';
@@ -22,8 +23,15 @@ export function QuoteForm({ bookingId }: { bookingId: string }) {
   const [sent, setSent] = useState(false);
 
   // sendQuote returns { ok: true, message: t('quoteSent') } on success.
+  // Toast feedback supplements the inline status card (kept for accessibility).
+  const lastToasted = useRef('');
   useEffect(() => {
     if (state.ok && state.message) setSent(true);
+    if (state.message && state.message !== lastToasted.current) {
+      lastToasted.current = state.message;
+      if (state.ok) toast.success(state.message);
+      else toast.error(state.message);
+    }
   }, [state]);
 
   if (sent && state.ok) {
