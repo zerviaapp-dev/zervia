@@ -101,6 +101,18 @@ const INTL_CURRENCY: Record<Currency, string> = {
 };
 
 /**
+ * Bare currency symbol for display, e.g. "CA$" for CAD, "$" for USD, "₱" for PHP.
+ * Used to adorn price inputs before an amount is entered.
+ */
+export function currencySymbol(currency: Currency): string {
+  const parts = new Intl.NumberFormat('en', {
+    style: 'currency',
+    currency: INTL_CURRENCY[currency],
+  }).formatToParts(0);
+  return parts.find((p) => p.type === 'currency')?.value ?? '';
+}
+
+/**
  * Format integer cents as money, e.g. "CA$19.00", "$14.04", "₱817".
  * Uses Intl so symbols/locales stay correct; the CAD code prefix keeps
  * CAD and USD visually distinct.
