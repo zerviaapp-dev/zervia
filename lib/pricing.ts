@@ -81,3 +81,84 @@ export function leadFeeCentsFor(category: string): number {
 export function isTestMode(): boolean {
   return process.env.STRIPE_TEST_MODE !== 'false';
 }
+
+/* ── Platform fees (approved Oct 9, 2026) ─────────────────────────────
+ *
+ * Charged to the PROVIDER on each completed booking, as basis points
+ * (1/100 of a percent) so the math stays in integers:
+ *   - Free providers (no subscription): 10%  (1000 bps)
+ *   - Member providers (paid subscription): 5% (500 bps)
+ *
+ * This beats the market: Fiverr 20%, TaskRabbit 15%, Upwork ~10%,
+ * Guru 9% free / 5% paid. The fee is always shown to the provider
+ * BEFORE they accept/complete a booking (transparency requirement).
+ *
+ * Marketing copy NEVER advertises these percentages — benefit-led only.
+ */
+
+export const PLATFORM_FEE_FREE_BPS = 1000; // 10%
+export const PLATFORM_FEE_MEMBER_BPS = 500; // 5%
+
+/* ── Audited-provider discount (approved Oct 9, 2026) ─────────────────
+ *
+ * Providers who PASS a random quality audit earn the 🏅 Audited badge
+ * plus a lower platform fee for 6 months:
+ *   - Free providers:  10% → 8%  (800 bps)
+ *   - Member providers: 5% → 4%  (400 bps)
+ *
+ * The badge is valid while `providers.audited_until` is in the future;
+ * it expires after 6 months and a new audit is required to renew it.
+ * Like all platform fees, the discounted rate is shown to the provider
+ * BEFORE they accept/complete a booking. Marketing copy never
+ * advertises percentages — benefit-led only.
+ */
+
+export const PLATFORM_FEE_FREE_AUDITED_BPS = 800; // 8%
+export const PLATFORM_FEE_MEMBER_AUDITED_BPS = 400; // 4%
+
+/** True while the provider's 🏅 Audited badge (and fee discount) is valid. */
+export function isAuditBadgeValid(auditedUntil: string | null | undefined): boolean {
+  if (!auditedUntil) return false;
+  return new Date(auditedUntil).getTime() > Date.now();
+}
+
+/**
+ * Basis points for a provider given membership status and audit badge.
+ * `isAudited` should come from `isAuditBadgeValid(provider.audited_until)`.
+ */
+export function platformFeeBps(isMember: boolean, isAudited = false): number {
+  if (isAudited) {
+    return isMember ? PLATFORM_FEE_MEMBER_AUDITED_BPS : PLATFORM_FEE_FREE_AUDITED_BPS;
+  }
+  return isMember ? PLATFORM_FEE_MEMBER_BPS : PLATFORM_FEE_FREE_BPS;
+}
+
+/** Fee in cents on a booking amount, rounded to the nearest cent. */
+export function platformFeeCents(
+  amountCents: number,
+  isMember: boolean,
+  isAudited = false
+): number {
+  return Math.round((amountCents * platformFeeBps(isMember, isAudited)) / 10000);
+}
+
+/** What the provider keeps after the platform fee, in cents. */
+export function providerNetCents(
+  amountCents: number,
+  isMember: boolean,
+  isAudited = false
+): number {
+  return amountCents - platformFeeCents(amountCents, isMember, isAudited);
+}
+
+/**
+ * True when the provider holds an active paid subscription.
+ * Members pay the reduced 5% platform fee.
+ */
+export function isMemberSubscription(
+  sub: { tier: string; status: string } | null
+): boolean {
+  if (!sub) return false;
+  if (sub.status !== 'active' && sub.status !== 'trialing') return false;
+  return sub.tier === 'pro' || sub.tier === 'business';
+}
