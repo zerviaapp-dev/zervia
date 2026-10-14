@@ -21,6 +21,9 @@ type ListingRow = {
   city: string | null;
   status: string;
   photos: unknown;
+  // Requires migration 0032_listing_coordinates; absent until it is applied.
+  latitude?: number | null;
+  longitude?: number | null;
 };
 
 /** Edit one of the caller's own listings (ownership enforced by RLS). */
@@ -53,13 +56,42 @@ export default async function EditListingPage({
     redirect(localizedPath('/app/provider', locale));
   }
 
-  const { data: listing } = (await supabase
+  // latitude/longitude arrive with migration 0032_listing_coordinates;
+  // until it is applied we retry the select without them (PostgREST 42703/PGRST204).
+  const withCoords =
+    'id, provider_id, title, description, category, subcategory, price_cents, price_type, country, city, status, photos, latitude, longitude';
+  const withoutCoords =
+    'id, provider_id, title, description, category, subcategory, price_cents, price_type, country, city, status, photos';
+  const minimal =
+    'id, provider_id, title, description, category, price_cents, price_type, country, city, status';
+  const listingQuery = supabase
     .from('listings')
-    .select(
-      'id, provider_id, title, description, category, subcategory, price_cents, price_type, country, city, status, photos'
-    )
+    .select(withCoords)
     .eq('id', id)
-    .maybeSingle()) as { data: ListingRow | null };
+    .maybeSingle();
+  const firstAttempt = (await listingQuery) as {
+    data: ListingRow | null;
+    error: { code?: string } | null;
+  };
+  const listingError = firstAttempt.error;
+  let listing = firstAttempt.data;
+  if (listingError && ['42703', 'PGRST204'].includes(listingError.code || '')) {
+    // Try without coords first, then minimal columns if photos/subcategory also missing
+    const secondAttempt = (await supabase
+      .from('listings')
+      .select(withoutCoords)
+      .eq('id', id)
+      .maybeSingle()) as { data: ListingRow | null; error: { code?: string } | null };
+    if (secondAttempt.error && ['42703', 'PGRST204'].includes(secondAttempt.error.code || '')) {
+      ({ data: listing } = (await supabase
+        .from('listings')
+        .select(minimal)
+        .eq('id', id)
+        .maybeSingle()) as { data: ListingRow | null });
+    } else {
+      listing = secondAttempt.data;
+    }
+  }
 
   // RLS already hides other providers' listings; this is defence in depth.
   if (!listing || listing.provider_id !== provider.id) {
@@ -78,6 +110,8 @@ export default async function EditListingPage({
     city: listing.city ?? '',
     status: listing.status,
     photos: Array.isArray(listing.photos) ? (listing.photos as string[]) : [],
+    latitude: listing.latitude ?? null,
+    longitude: listing.longitude ?? null,
   };
 
   return (
