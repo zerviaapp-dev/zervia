@@ -5,19 +5,27 @@ import { Panel } from '@/components/Panel';
 import { NotConfigured } from '@/components/auth/NotConfigured';
 import { BookingRequestForm } from '@/components/booking/BookingRequestForm';
 import { createClient } from '@/lib/supabase/server';
+import { getBookableSlots } from '@/lib/supabase/slots';
 import { localizedPath } from '@/lib/locale-path';
 
 /**
  * Booking request form for a listing. Requires sign-in (anonymous visitors
  * are bounced to login with a return trip). The listing must be publicly
  * visible — RLS decides; anything else → 404, never a hint it exists.
+ *
+ * `?notes=` pre-fills the notes field (used by one-tap rebook).
+ * When the provider has a weekly availability schedule, open slots for
+ * the next 14 days are offered as a tap-to-pick calendar.
  */
 export default async function BookingRequestPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ locale: string; id: string }>;
+  searchParams: Promise<{ notes?: string }>;
 }) {
   const { locale, id } = await params;
+  const { notes } = await searchParams;
   const t = await getTranslations({ locale, namespace: 'Bookings' });
   const supabase = await createClient();
 
@@ -52,6 +60,8 @@ export default async function BookingRequestPage({
     notFound();
   }
 
+  const slots = await getBookableSlots(listing.id);
+
   return (
     <div className="space-y-5">
       <Link
@@ -67,7 +77,11 @@ export default async function BookingRequestPage({
       </p>
 
       <Panel>
-        <BookingRequestForm listingId={listing.id} />
+        <BookingRequestForm
+          listingId={listing.id}
+          slots={slots}
+          defaultNotes={typeof notes === 'string' ? notes.slice(0, 2000) : undefined}
+        />
       </Panel>
     </div>
   );
