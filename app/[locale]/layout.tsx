@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from 'next';
+import { Inter } from 'next/font/google';
 import { NextIntlClientProvider, hasLocale } from 'next-intl';
 import { getMessages, setRequestLocale } from 'next-intl/server';
 import { notFound } from 'next/navigation';
@@ -7,13 +8,22 @@ import { isRtl, type Locale } from '@/lib/locales';
 import { SWRegister } from '@/components/SWRegister';
 import { InstallPrompt } from '@/components/InstallPrompt';
 import { CookieBanner } from '@/components/CookieBanner';
+import { ToasterClient } from '@/components/ToasterClient';
 import '../globals.css';
+
+/** Inter — the Zervia display/body font. Loaded once, self-hosted by Next. */
+const inter = Inter({
+  subsets: ['latin'],
+  weight: ['400', '600', '700', '800'],
+  variable: '--font-inter',
+  display: 'swap',
+});
 
 export function generateStaticParams() {
   return routing.locales.map((locale) => ({ locale }));
 }
 
-const SITE_URL = 'https://zervia-app-deploy.vercel.app';
+const SITE_URL = 'https://zervia.app';
 
 /** Per-locale SEO strings (short title/description — kept in code to avoid
  *  touching 10 locale message files for two strings). */
@@ -76,10 +86,19 @@ export async function generateMetadata({
   const { locale } = await params;
   const seo = SEO[locale] ?? SEO.en;
   const url = locale === 'en' ? SITE_URL : `${SITE_URL}/${locale}`;
+  // hreflang alternates for all 10 locales (prevents duplicate-content penalties)
+  const languages: Record<string, string> = {};
+  for (const l of Object.keys(SEO)) {
+    languages[l] = l === 'en' ? SITE_URL : `${SITE_URL}/${l}`;
+  }
   return {
     metadataBase: new URL(SITE_URL),
     title: seo.title,
     description: seo.description,
+    alternates: {
+      canonical: url,
+      languages,
+    },
     manifest: '/manifest.webmanifest',
     icons: {
       icon: [
@@ -141,12 +160,13 @@ export default async function LocaleLayout({
   const dir = isRtl(locale as Locale) ? 'rtl' : 'ltr';
 
   return (
-    <html lang={locale} dir={dir}>
+    <html lang={locale} dir={dir} className={inter.variable}>
       <body>
         <NextIntlClientProvider messages={messages}>
           <SWRegister />
           <InstallPrompt />
           <CookieBanner />
+          <ToasterClient />
           {children}
         </NextIntlClientProvider>
       </body>
