@@ -5,11 +5,14 @@ import { Panel } from '@/components/Panel';
 import { Button } from '@/components/Button';
 import { NotConfigured } from '@/components/auth/NotConfigured';
 import { CheckoutButton } from '@/components/billing/CheckoutButton';
+import { PayPalButton } from '@/components/billing/PayPalButton';
+import { PaymentMethodBadges } from '@/components/billing/PaymentMethodBadges';
 import { PortalButton } from '@/components/billing/PortalButton';
 import { BoostPurchase, type BoostListing } from '@/components/billing/BoostPurchase';
 import { OneTimePurchases } from '@/components/billing/OneTimePurchases';
 import { createClient } from '@/lib/supabase/server';
 import { isStripeConfigured } from '@/lib/stripe';
+import { isPayPalConfigured } from '@/lib/paypal';
 import {
   getMyProvider,
   getSubscription,
@@ -121,6 +124,12 @@ export default async function BillingPage({
 
   const yearly = interval === 'year';
   const stripeReady = isStripeConfigured();
+  const paypalReady = isPayPalConfigured();
+  // Apple Pay / Google Pay are offered automatically by Stripe Checkout
+  // on supported devices once enabled in the Stripe Dashboard
+  // (Settings → Payments → Wallets). The founder flips this env var
+  // after enabling them there, which lights up the badges below.
+  const walletsReady = stripeReady && process.env.STRIPE_WALLETS_ENABLED === 'true';
   const testMode = stripeReady && isTestMode();
   // Prices are shown in the provider's own currency (from their profile
   // country). Tier constants are CAD-base; we convert for display.
@@ -151,6 +160,10 @@ export default async function BillingPage({
           <p className="mt-1 text-base text-brand-700">{t('checkoutCancelledText')}</p>
         </Panel>
       ) : null}
+
+      <Panel>
+        <PaymentMethodBadges paypalReady={paypalReady} walletsReady={walletsReady} />
+      </Panel>
 
       <Panel>
         <h2 className="text-lg font-bold text-brand-900">
@@ -234,15 +247,29 @@ export default async function BillingPage({
                   <span className="inline-flex min-h-[56px] items-center rounded-full bg-brand-100 px-8 text-lg font-semibold text-brand-800">
                     {t('ctaCurrent')}
                   </span>
-                ) : stripeReady ? (
-                  <CheckoutButton
-                    kind="subscription"
-                    tier={plan.key}
-                    interval={yearly ? 'year' : 'month'}
-                    locale={locale}
-                    label={t('ctaChoose', { tier: plan.name })}
-                    highlight={plan.key === 'pro'}
-                  />
+                ) : stripeReady || paypalReady ? (
+                  <div className="flex flex-wrap gap-2">
+                    {stripeReady ? (
+                      <CheckoutButton
+                        kind="subscription"
+                        tier={plan.key}
+                        interval={yearly ? 'year' : 'month'}
+                        locale={locale}
+                        label={t('ctaChoose', { tier: plan.name })}
+                        highlight={plan.key === 'pro'}
+                      />
+                    ) : null}
+                    {paypalReady ? (
+                      <CheckoutButton
+                        kind="subscription"
+                        tier={plan.key}
+                        interval={yearly ? 'year' : 'month'}
+                        locale={locale}
+                        label={t('ctaChoosePayPal', { tier: plan.name })}
+                        method="paypal"
+                      />
+                    ) : null}
+                  </div>
                 ) : (
                   <span className="text-sm text-brand-600">{t('testMode')}</span>
                 )}
@@ -261,6 +288,7 @@ export default async function BillingPage({
             listings={(listings ?? []) as BoostListing[]}
             locale={locale}
             stripeReady={stripeReady}
+            paypalReady={paypalReady}
             boostPriceLabel={formatCurrency(convertCadCents(BOOST_CENTS, currency), currency, locale)}
           />
         ) : (
@@ -277,6 +305,7 @@ export default async function BillingPage({
           listings={(listings ?? []).map((l) => ({ id: l.id, title: l.title }))}
           locale={locale}
           stripeReady={stripeReady}
+          paypalReady={paypalReady}
           badgeOwned={provider.verification_badge ?? false}
           badgePriceLabel={formatCurrency(convertCadCents(VERIFICATION_BADGE_CENTS, currency), currency, locale)}
           featuredWeekPriceLabel={formatCurrency(convertCadCents(FEATURED_WEEK_CENTS, currency), currency, locale)}
