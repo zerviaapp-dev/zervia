@@ -7,7 +7,6 @@ import { defaultLocale } from '@/lib/locales';
 import { rateLimit } from '@/lib/rate-limit';
 import type { ActionResult } from './actions';
 
-export type { ActionResult };
 
 const REPORT_REASONS = ['spam', 'scam', 'inappropriate', 'fake', 'other'] as const;
 
