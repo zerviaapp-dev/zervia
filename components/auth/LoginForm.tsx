@@ -1,12 +1,14 @@
 'use client';
 
-import { useActionState } from 'react';
+import { useActionState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { useLocale, useTranslations } from 'next-intl';
+import { toast } from 'sonner';
 import { Link } from '@/i18n/routing';
 import { signIn, type ActionResult } from '@/lib/supabase/actions';
 import { Field } from './Field';
 import { SubmitButton } from './SubmitButton';
+import { SocialLoginButtons } from './SocialLoginButtons';
 
 const initialState: ActionResult = { ok: false, message: '' };
 
@@ -15,6 +17,16 @@ export function LoginForm() {
   const locale = useLocale();
   const searchParams = useSearchParams();
   const [state, formAction] = useActionState(signIn, initialState);
+
+  // Toast feedback supplements the inline error card (kept for accessibility).
+  const lastToasted = useRef('');
+  useEffect(() => {
+    if (state.message && state.message !== lastToasted.current) {
+      lastToasted.current = state.message;
+      if (state.ok) toast.success(state.message);
+      else toast.error(state.message);
+    }
+  }, [state]);
 
   const urlError = searchParams.get('error');
   const banner =
@@ -31,6 +43,8 @@ export function LoginForm() {
 
       <h1 className="text-3xl font-bold text-brand-900">{t('loginTitle')}</h1>
       <p className="text-base text-brand-800">{t('loginSubtitle')}</p>
+
+      <SocialLoginButtons />
 
       {banner ? (
         <p role="alert" className="rounded-2xl bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
