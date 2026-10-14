@@ -1,7 +1,7 @@
 'use server';
 
 import { revalidatePath } from 'next/cache';
-import { getStripe, isStripeConfigured } from '@/lib/stripe';
+import { getStripe, isStripeConfigured, isStripeTestMode } from '@/lib/stripe';
 import { createAdminClient } from './admin';
 import { createClient, isSupabaseConfigured } from './server';
 import { defaultLocale } from '@/lib/locales';
@@ -86,6 +86,64 @@ async function captureIfHeld(row: EscrowRow): Promise<void> {
 }
 
 /**
+ * Refund a held escrow when a booking is cancelled (internal, never throws).
+ * Called from setBookingStatus on 'cancelled'. The job didn't happen, so the
+ * customer's money goes back automatically — no admin action needed.
+ * Uses the admin client internally (same pattern as autoReleaseEscrow).
+ */
+export async function refundEscrowOnCancel(bookingId: string): Promise<void> {
+  try {
+    if (!isStripeConfigured()) return;
+    const admin = createAdminClient();
+    if (!admin) return;
+    const row = await getEscrow(admin, bookingId);
+    if (!row || row.status !== 'held') return;
+    try {
+      if (row.stripe_payment_intent_id) {
+        const stripe = getStripe();
+        const pi = await stripe.paymentIntents.retrieve(
+          row.stripe_payment_intent_id
+        );
+        if (pi.status === 'requires_capture') {
+          // Never captured: cancel the authorization instead of refunding.
+          await stripe.paymentIntents.cancel(row.stripe_payment_intent_id);
+        } else {
+          await stripe.refunds.create({
+            payment_intent: row.stripe_payment_intent_id,
+          });
+        }
+      }
+    } catch (err) {
+      console.error('[escrow] auto-refund on cancel failed', bookingId, err);
+      return;
+    }
+    await admin
+      .from('escrow_payments')
+      .update({ status: 'refunded', refunded_at: new Date().toISOString() })
+      .eq('id', row.id);
+    await admin.from('transactions').insert({
+      user_id: row.customer_id,
+      provider_id: row.provider_id,
+      stripe_payment_intent_id: row.stripe_payment_intent_id,
+      amount_cents: row.amount_cents,
+      currency: row.currency ?? 'cad',
+      type: 'refund',
+      status: 'refunded',
+      description: isStripeTestMode()
+        ? 'Escrow auto-refunded on cancellation (TEST MODE)'
+        : 'Escrow auto-refunded on cancellation',
+    });
+    console.log(
+      '[escrow] auto-refunded on cancel',
+      bookingId,
+      `${row.amount_cents} ${row.currency ?? 'cad'}`
+    );
+  } catch (err) {
+    console.error('[escrow] refundEscrowOnCancel threw', bookingId, err);
+  }
+}
+
+/**
  * Release a held escrow to the provider (admin only).
  * Used for manual release and for dispute resolution in the provider's favour.
  */
@@ -117,8 +175,28 @@ export async function releaseEscrow(
     currency: row.currency ?? 'cad',
     type: 'escrow',
     status: 'succeeded',
-    description: 'Escrow released to provider (TEST MODE)',
+    description: 'Escrow released to provider',
   });
+
+  // Stripe Connect payout: transfer the provider's share (minus platform
+  // fee) to their Connect Express account. Never throws — a payout hiccup
+  // must not break the release itself; the payout row records the state
+  // and an admin can retry from the payouts view.
+  try {
+    const { payoutToProvider } = await import('@/lib/stripe-connect');
+    const payout = await payoutToProvider(row.id);
+    if (!payout.ok && payout.reason === 'no_connect_account') {
+      console.log(
+        '[escrow] release ok, provider has no Connect account yet — payout pending onboarding',
+        bookingId
+      );
+    } else if (!payout.ok) {
+      console.error('[escrow] payout failed after release', bookingId, payout.reason);
+    }
+  } catch (err) {
+    console.error('[escrow] payout threw after release', bookingId, err);
+  }
+
   revalidateBooking(locale, bookingId);
   return { ok: true, message: 'Payment released to the provider.' };
 }
@@ -164,7 +242,9 @@ export async function refundEscrow(
     currency: row.currency ?? 'cad',
     type: 'refund',
     status: 'refunded',
-    description: 'Escrow refunded to customer (TEST MODE)',
+    description: isStripeTestMode()
+      ? 'Escrow refunded to customer (TEST MODE)'
+      : 'Escrow refunded to customer',
   });
   revalidateBooking(locale, bookingId);
   return { ok: true, message: 'Payment refunded to the customer.' };
@@ -250,7 +330,9 @@ export async function autoReleaseEscrow(bookingId: string): Promise<void> {
       currency: row.currency ?? 'cad',
       type: 'escrow',
       status: 'succeeded',
-      description: 'Escrow auto-released on completion (TEST MODE)',
+      description: isStripeTestMode()
+        ? 'Escrow auto-released on completion (TEST MODE)'
+        : 'Escrow auto-released on completion',
     });
   } catch (err) {
     console.error('[escrow] auto-release failed', bookingId, err);
@@ -317,4 +399,38 @@ export async function requestRework(
 
   revalidatePath(`/${locale}/app/bookings/${bookingId}`);
   return { ok: true, message: 'Rework requested. The provider has been notified.' };
+}
+
+/**
+ * Retry a failed provider payout (admin only).
+ * Only payouts with status='failed' can be retried. The retry atomically
+ * claims the failed row (delete-if-still-failed) and attempts a fresh
+ * Stripe transfer via payoutToProvider, which recreates the payout row on
+ * success. Concurrent retries are safe: exactly one caller wins the claim.
+ */
+export async function retryPayout(
+  payoutId: string,
+  locale: string = defaultLocale
+): Promise<ActionResult> {
+  const s = await adminSession();
+  if (!s.ok) return s;
+
+  const { data: payout } = await s.admin
+    .from('payouts')
+    .select('id, escrow_payment_id, status')
+    .eq('id', payoutId)
+    .maybeSingle();
+  const pr = payout as { id: string; escrow_payment_id: string; status: string } | null;
+  if (!pr) return { ok: false, message: 'Payout not found.' };
+  if (pr.status !== 'failed') {
+    return { ok: false, message: 'Only failed payouts can be retried.' };
+  }
+
+  const { payoutToProvider } = await import('@/lib/stripe-connect');
+  const result = await payoutToProvider(pr.escrow_payment_id);
+  if (!result.ok) {
+    return { ok: false, message: `Retry failed: ${result.reason}` };
+  }
+  revalidatePath(`/${locale}/app/admin/payouts`);
+  return { ok: true, message: 'Payout retried successfully.' };
 }
