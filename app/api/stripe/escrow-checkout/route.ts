@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { headers } from 'next/headers';
 import { createClient } from '@/lib/supabase/server';
-import { getStripe, isStripeConfigured } from '@/lib/stripe';
+import { getStripe, isStripeConfigured, isStripeTestMode } from '@/lib/stripe';
+import { mapStripeError, logStripeError } from '@/lib/stripe-errors';
 import { currencyForCountry } from '@/lib/currency';
 import { localizedPath } from '@/lib/locale-path';
 import { takeAsync } from '@/lib/rate-limit';
+import { getSiteOrigin } from '@/lib/site-origin';
 
 export const runtime = 'nodejs';
 
@@ -65,13 +66,38 @@ export async function POST(req: NextRequest) {
   // The amount is denominated in the PROVIDER's currency — the provider
   // set the price in their own market. The customer is charged that
   // currency at Stripe; the UI converts for display.
-  const { data: booking } = await supabase
+  const SELECT_FULL =
+    'id, customer_id, provider_id, status, agreed_price_cents, listings(id, title, price_cents, price_type), providers(business_name, country)';
+  const SELECT_MINIMAL =
+    'id, customer_id, provider_id, status, listings(id, title, price_cents, price_type), providers(business_name, country)';
+
+  let bookingResult = (await supabase
     .from('bookings')
-    .select(
-      'id, customer_id, provider_id, status, agreed_price_cents, listings(id, title, price_cents, price_type), providers(business_name, country)'
-    )
+    .select(SELECT_FULL)
     .eq('id', bookingId)
-    .maybeSingle();
+    .maybeSingle()) as {
+    data: {
+      id: string;
+      customer_id: string;
+      provider_id: string;
+      status: string;
+      agreed_price_cents?: number | null;
+      listings: { id: string; title: string; price_cents: number | null; price_type: string } | null;
+      providers: { business_name: string; country?: string | null } | null;
+    } | null;
+    error: { code?: string } | null;
+  };
+
+  // Fallback if agreed_price_cents column is missing (42703/PGRST204)
+  if (bookingResult.error && ['42703', 'PGRST204'].includes(bookingResult.error.code || '')) {
+    bookingResult = (await supabase
+      .from('bookings')
+      .select(SELECT_MINIMAL)
+      .eq('id', bookingId)
+      .maybeSingle()) as typeof bookingResult;
+  }
+
+  const booking = bookingResult.data;
 
   if (!booking || booking.customer_id !== user.id) {
     return NextResponse.json({ error: 'not_found' }, { status: 404 });
@@ -109,49 +135,78 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const stripe = getStripe();
-  const h = await headers();
-  const origin = h.get('origin') ?? '';
-  const successUrl = `${origin}${localizedPath(`/app/bookings/${bookingId}`, locale)}?payment=success`;
-  const cancelUrl = `${origin}${localizedPath(`/app/bookings/${bookingId}`, locale)}?payment=cancelled`;
+  let session;
+  try {
+    const stripe = getStripe();
+    const origin = getSiteOrigin(); // SECURE: never trust client Origin header
+    const successUrl = `${origin}${localizedPath(`/app/bookings/${bookingId}`, locale)}?payment=success`;
+    const cancelUrl = `${origin}${localizedPath(`/app/bookings/${bookingId}`, locale)}?payment=cancelled`;
 
-  const serviceName = listing?.title ?? 'Zervia service';
+    const serviceName = listing?.title ?? 'Zervia service';
 
-  const session = await stripe.checkout.sessions.create({
-    mode: 'payment',
-    line_items: [
-      {
-        price_data: {
-          currency,
-          unit_amount: amount,
-          product_data: {
-            name: `Zervia escrow — ${serviceName}`,
-            description: `Held securely until the job is done. Provider: ${provider?.business_name ?? '—'}. TEST MODE — no real charge.`,
+    session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [
+        {
+          price_data: {
+            currency,
+            unit_amount: amount,
+            product_data: {
+              name: `Zervia escrow — ${serviceName}`,
+              description: isStripeTestMode()
+                ? `Held securely until the job is done. Provider: ${provider?.business_name ?? '—'}. TEST MODE — no real charge.`
+                : `Held securely until the job is done. Provider: ${provider?.business_name ?? '—'}.`,
+            },
           },
+          quantity: 1,
         },
-        quantity: 1,
+      ],
+      // Authorize now, capture on completion. Uncaptured intents auto-release
+      // after 7 days, so money can never get stuck.
+      payment_intent_data: {
+        capture_method: 'manual',
+        metadata: {
+          zervia_kind: 'escrow',
+          zervia_booking_id: bookingId,
+          zervia_user_id: user.id,
+          zervia_provider_id: booking.provider_id as string,
+        },
       },
-    ],
-    // Authorize now, capture on completion. Uncaptured intents auto-release
-    // after 7 days, so money can never get stuck.
-    payment_intent_data: {
-      capture_method: 'manual',
       metadata: {
         zervia_kind: 'escrow',
         zervia_booking_id: bookingId,
         zervia_user_id: user.id,
         zervia_provider_id: booking.provider_id as string,
       },
-    },
-    metadata: {
-      zervia_kind: 'escrow',
-      zervia_booking_id: bookingId,
-      zervia_user_id: user.id,
-      zervia_provider_id: booking.provider_id as string,
-    },
-    success_url: successUrl,
-    cancel_url: cancelUrl,
-  });
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+    });
+  } catch (err) {
+    // Bulletproof error handling: map to safe error, log with context
+    const safeError = mapStripeError(err);
+    logStripeError(
+      {
+        operation: 'escrow-checkout-session-create',
+        bookingId,
+        userId: user.id,
+        amountCents: amount,
+        currency,
+      },
+      safeError,
+      err
+    );
+
+    // Return safe error to client - NEVER expose raw Stripe errors or internals
+    return NextResponse.json(
+      {
+        error: safeError.code,
+        userMessage: safeError.userMessage,
+        declineCode: safeError.declineCode,
+        retryable: safeError.retryable,
+      },
+      { status: safeError.code === 'rate_limited' ? 429 : 502 }
+    );
+  }
 
   return NextResponse.json({ url: session.url });
 }
