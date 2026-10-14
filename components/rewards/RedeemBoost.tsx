@@ -3,9 +3,9 @@
 import { useActionState } from 'react';
 import { useTranslations } from 'next-intl';
 import {
-  redeemPointsForBoost,
-  type ActionResult,
+  redeemPointsForBoost
 } from '@/lib/supabase/rewards-actions';
+import type { ActionResult } from '@/lib/supabase/actions';
 import { SubmitButton } from '@/components/auth/SubmitButton';
 
 const initialState: ActionResult = { ok: false, message: '' };
