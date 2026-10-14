@@ -8,10 +8,86 @@ import { defaultLocale } from '@/lib/locales';
 import { localizedPath } from '@/lib/locale-path';
 import { rateLimit } from '@/lib/rate-limit';
 import type { ActionResult } from './actions';
-import { autoReleaseEscrow } from './escrow-actions';
+import { autoReleaseEscrow, refundEscrowOnCancel } from './escrow-actions';
 import { applyOfferRewards } from './offer-actions';
+import { notifyUser } from './notifications';
+import {
+  platformFeeCents,
+  isMemberSubscription,
+  isAuditBadgeValid,
+} from '@/lib/pricing';
 
-export type { ActionResult };
+
+/**
+ * Record the platform fee when a booking completes.
+ * Free providers: 10% (8% with a valid 🏅 Audited badge).
+ * Members (active pro/business subscription): 5% (4% with badge).
+ * Never throws — a fee-recording hiccup must not break completion.
+ */
+async function recordPlatformFee(bookingId: string): Promise<void> {
+  try {
+    const { createAdminClient } = await import('./admin');
+    const admin = createAdminClient();
+    if (!admin) return;
+
+    // Booking amount: agreed price, else the listing's fixed price.
+    const { data: booking } = await admin
+      .from('bookings')
+      .select(
+        'id, customer_id, provider_id, agreed_price_cents, listings!inner(price_cents, price_type)'
+      )
+      .eq('id', bookingId)
+      .maybeSingle();
+    if (!booking) return;
+    const listing = Array.isArray(booking.listings)
+      ? booking.listings[0]
+      : booking.listings;
+    const amountCents =
+      booking.agreed_price_cents ??
+      (listing?.price_type === 'fixed' ? listing?.price_cents : null);
+    if (!amountCents || amountCents <= 0) return;
+
+    // Membership: active pro/business subscription?
+    const { data: sub } = await admin
+      .from('subscriptions')
+      .select('tier, status')
+      .eq('provider_id', booking.provider_id)
+      .maybeSingle();
+    const isMember = isMemberSubscription(sub);
+    // Audited discount: valid 🏅 badge lowers the fee (8% free / 4% member).
+    const { data: provider } = await admin
+      .from('providers')
+      .select('audited_until')
+      .eq('id', booking.provider_id)
+      .maybeSingle();
+    const isAudited = isAuditBadgeValid(
+      (provider as { audited_until: string | null } | null)?.audited_until ?? null
+    );
+    const feeCents = platformFeeCents(amountCents, isMember, isAudited);
+    if (feeCents <= 0) return;
+
+    // Idempotency: don't double-record for the same booking.
+    const { data: existing } = await admin
+      .from('transactions')
+      .select('id')
+      .eq('type', 'platform_fee')
+      .eq('description', `Platform fee for booking ${bookingId}`)
+      .maybeSingle();
+    if (existing) return;
+
+    await admin.from('transactions').insert({
+      user_id: booking.customer_id,
+      provider_id: booking.provider_id,
+      amount_cents: feeCents,
+      currency: 'cad',
+      type: 'platform_fee',
+      status: 'succeeded',
+      description: `Platform fee for booking ${bookingId}`,
+    });
+  } catch (err) {
+    console.error('[booking] platform fee recording failed', bookingId, err);
+  }
+}
 
 async function bookingT(locale: string) {
   return getTranslations({ locale, namespace: 'Bookings' });
@@ -72,9 +148,11 @@ async function ownProvider(
   return data ?? null;
 }
 
-/** Send an in-app notification via the SECURITY DEFINER helper (RLS-safe). */
+/** Send an in-app notification via the service-role client (migration 0036
+ * revoked `notify_user` from `authenticated` — the session client can no
+ * longer call it). See `lib/supabase/notifications.ts`. */
 async function notify(
-  supabase: NonNullable<Awaited<ReturnType<typeof createClient>>>,
+  _supabase: NonNullable<Awaited<ReturnType<typeof createClient>>>,
   args: {
     userId: string;
     type: string;
@@ -84,14 +162,7 @@ async function notify(
     link?: string;
   }
 ): Promise<void> {
-  await supabase.rpc('notify_user', {
-    p_user_id: args.userId,
-    p_type: args.type,
-    p_title_key: args.titleKey,
-    p_body_key: args.bodyKey,
-    p_body_args: args.bodyArgs ?? {},
-    p_link: args.link ?? null,
-  });
+  await notifyUser(args);
 }
 
 function bookingLink(id: string): string {
@@ -273,6 +344,16 @@ export async function setBookingStatus(formData: FormData): Promise<void> {
     // Merchant offers: award points for any loaded, qualifying offers.
     // Never throws — rewards must not break completion.
     await applyOfferRewards(booking.id);
+    // Platform fee: 10% free providers, 5% members. Recorded as a
+    // transaction for the provider's billing history. Never throws.
+    await recordPlatformFee(booking.id);
+  }
+
+  // Held escrow auto-refunds when the booking is cancelled: the job didn't
+  // happen, so the customer's money goes back. Never throws — a Stripe
+  // hiccup must not break the cancellation itself.
+  if (target === 'cancelled') {
+    await refundEscrowOnCancel(booking.id);
   }
 
   // Notify the affected parties.
@@ -360,7 +441,7 @@ export async function setBookingStatus(formData: FormData): Promise<void> {
 
 /**
  * Flag a booking as disputed with a reason (10–2000 chars). Either party
- * may dispute a pending/confirmed booking; the DB trigger demands the
+ * may dispute a pending/confirmed/in_progress booking; the DB trigger demands the
  * reason and only admins move it out of disputed (Phase 6 resolution UI).
  */
 export async function disputeBooking(
@@ -388,7 +469,7 @@ export async function disputeBooking(
     data: (BookingRow & { listings: { title: string } }) | null;
   };
   if (!booking) return { ok: false, message: t('errorGeneric') };
-  if (!['pending', 'confirmed'].includes(booking.status))
+  if (!['pending', 'confirmed', 'in_progress'].includes(booking.status))
     return { ok: false, message: t('errorDisputeNotAllowed') };
 
   const provider = await ownProvider(supabase, userId);
@@ -447,6 +528,19 @@ export async function submitReview(
   const rating = Number(str(formData, 'rating'));
   const text = str(formData, 'text');
 
+  // Optional before/after photos (client-uploaded URLs, max 3).
+  let photoUrls: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(str(formData, 'photo_urls') || '[]');
+    if (Array.isArray(parsed)) {
+      photoUrls = parsed
+        .filter((u): u is string => typeof u === 'string' && /^https:\/\//.test(u))
+        .slice(0, 3);
+    }
+  } catch {
+    photoUrls = [];
+  }
+
   if (!bookingId) return { ok: false, message: t('errorGeneric') };
   if (!Number.isInteger(rating) || rating < 1 || rating > 5)
     return { ok: false, message: t('errorRating') };
@@ -483,12 +577,15 @@ export async function submitReview(
     .maybeSingle();
   if (existing) return { ok: false, message: t('errorAlreadyReviewed') };
 
+  // NOTE: photo_urls requires migration 0029. Until it is applied the
+  // insert below fails closed (review rejected) rather than dropping photos.
   const { error } = await supabase.from('reviews').insert({
     booking_id: booking.id,
     reviewer_id: userId,
     provider_id: booking.provider_id,
     rating,
     text: text || null,
+    photo_urls: photoUrls,
   });
   if (error) return { ok: false, message: t('errorGeneric') };
 
