@@ -26,6 +26,7 @@ export default async function AppShell({
   // Unread notification count for the bell badge (0 when signed out or
   // when Supabase isn't configured yet — never a crash).
   let unread = 0;
+  let hasProvider = false;
   if (authed && supabase) {
     const {
       data: { user },
@@ -37,6 +38,12 @@ export default async function AppShell({
         .eq('user_id', user.id)
         .eq('read', false);
       unread = count ?? 0;
+      // Provider nav link: only shown when the user has a provider row.
+      const { count: providerCount } = await supabase
+        .from('providers')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', user.id);
+      hasProvider = (providerCount ?? 0) > 0;
     }
   }
 
@@ -94,6 +101,14 @@ export default async function AppShell({
               >
                 {t('appNavProfile')}
               </Link>
+              {hasProvider ? (
+                <Link
+                  href="/app/provider"
+                  className="inline-flex min-h-[44px] items-center rounded-full px-4 font-semibold text-brand-700"
+                >
+                  {t('appNavProvider')}
+                </Link>
+              ) : null}
               <SignOutButton locale={locale} />
             </nav>
           ) : null}
