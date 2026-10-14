@@ -1,11 +1,16 @@
 'use server';
 
 import { revalidatePath } from 'next/cache';
+import { headers } from 'next/headers';
 import { createClient, isSupabaseConfigured } from './server';
 import { defaultLocale } from '@/lib/locales';
 import type { ActionResult } from './actions';
+import {
+  createIdentityVerificationSession,
+  getIdentityStatus,
+  type IdentityStatus,
+} from '@/lib/verification';
 
-export type { ActionResult };
 
 const DOC_TYPES = ['government_id', 'professional_license', 'insurance_proof', 'background_check'] as const;
 
@@ -182,4 +187,144 @@ export async function rejectVerification(formData: FormData): Promise<ActionResu
   const locale = localeOf(formData);
   revalidatePath(`/${locale}/app/admin/verification`);
   return { ok: true, message: '' };
+}
+
+/**
+ * Admin gets a short-lived signed URL to view a verification document.
+ * The `verification-docs` bucket is private — documents are never exposed
+ * publicly. The URL expires after 60 seconds. Returns { ok, url } or
+ * { ok: false, message }.
+ */
+export async function getVerificationDocUrl(
+  docId: string
+): Promise<{ ok: true; url: string } | { ok: false; message: string }> {
+  if (!isSupabaseConfigured()) {
+    return { ok: false, message: 'Supabase is not configured.' };
+  }
+  const supabase = await createClient();
+  if (!supabase) {
+    return { ok: false, message: 'Supabase is not configured.' };
+  }
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return { ok: false, message: 'Please sign in.' };
+  }
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', user.id)
+    .single();
+  if (profile?.role !== 'admin') {
+    return { ok: false, message: 'Admin only.' };
+  }
+
+  const { data: doc } = await supabase
+    .from('verification_documents')
+    .select('storage_path')
+    .eq('id', docId)
+    .maybeSingle();
+  const storagePath = (doc as { storage_path?: string } | null)?.storage_path;
+  if (!storagePath) {
+    return { ok: false, message: 'Document not found.' };
+  }
+
+  const { data, error } = await supabase.storage
+    .from('verification-docs')
+    .createSignedUrl(storagePath, 60);
+  if (error || !data?.signedUrl) {
+    return { ok: false, message: 'Could not generate a viewing link. Please try again.' };
+  }
+  return { ok: true, url: data.signedUrl };
+}
+
+// ---------------------------------------------------------------------------
+// Stripe Identity (document) verification — server actions
+// ---------------------------------------------------------------------------
+
+export type IdentityActionResult = {
+  ok: boolean;
+  status?: IdentityStatus;
+  url?: string;
+  message?: string;
+};
+
+/** Site origin for Stripe return_url — same pattern as actions.ts. */
+async function identitySiteOrigin(): Promise<string> {
+  // SECURITY: Never trust the client-controlled Origin header (open redirect).
+  const { getSiteOrigin } = await import('@/lib/site-origin');
+  return getSiteOrigin();
+}
+
+type ProviderSession =
+  | { ok: true; userId: string }
+  | { ok: false; message: string };
+
+/**
+ * Auth + provider-role gate shared by the Identity actions.
+ */
+async function requireProviderForIdentity(): Promise<ProviderSession> {
+  if (!isSupabaseConfigured()) {
+    return { ok: false, message: 'Supabase is not configured.' };
+  }
+  const supabase = await createClient();
+  if (!supabase) {
+    return { ok: false, message: 'Supabase is not configured.' };
+  }
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return { ok: false, message: 'Please sign in.' };
+  }
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', user.id)
+    .single();
+  if (profile?.role !== 'provider') {
+    return { ok: false, message: 'Providers only.' };
+  }
+  return { ok: true, userId: user.id };
+}
+
+/**
+ * Provider starts Stripe Identity verification.
+ * Returns the hosted Stripe URL — the client redirects the provider to it.
+ * `returnUrl` must be an absolute same-origin URL (open-redirect protection);
+ * falls back to the provider verification page.
+ */
+export async function startIdentityVerification(
+  returnUrl: string
+): Promise<IdentityActionResult> {
+  const gate = await requireProviderForIdentity();
+  if (!gate.ok) return gate;
+
+  const origin = await identitySiteOrigin();
+  let target: URL | null = null;
+  try {
+    const u = new URL(returnUrl);
+    if (u.origin === origin) target = u;
+  } catch {
+    // Not an absolute URL — fall through to the default.
+  }
+  const safeReturnUrl = target
+    ? target.toString()
+    : `${origin}/${defaultLocale}/app/provider/verification`;
+
+  const res = await createIdentityVerificationSession(gate.userId, safeReturnUrl);
+  if (!res.ok) return { ok: false, message: res.error };
+  return { ok: true, url: res.url };
+}
+
+/**
+ * Provider reads their own Stripe Identity status.
+ */
+export async function getMyIdentityStatus(): Promise<IdentityActionResult> {
+  const gate = await requireProviderForIdentity();
+  if (!gate.ok) return gate;
+  const status = await getIdentityStatus(gate.userId);
+  return { ok: true, status };
 }
