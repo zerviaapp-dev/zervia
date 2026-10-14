@@ -2,7 +2,8 @@
 
 import { useActionState, useState } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
-import { reportListing, type ActionResult } from '@/lib/supabase/moderation-actions';
+import { reportListing} from '@/lib/supabase/moderation-actions';
+import type { ActionResult } from '@/lib/supabase/actions';
 
 const initialState: ActionResult = { ok: false, message: '' };
 
@@ -20,7 +21,7 @@ export function ReportButton({
   providerId,
   signedIn,
 }: {
-  listingId: string;
+  listingId?: string;
   providerId?: string;
   signedIn: boolean;
 }) {
@@ -84,7 +85,9 @@ export function ReportButton({
             ) : (
               <form action={formAction} className="mt-4 space-y-4">
                 <input type="hidden" name="locale" value={locale} />
-                <input type="hidden" name="listingId" value={listingId} />
+                {listingId && (
+                  <input type="hidden" name="listingId" value={listingId} />
+                )}
                 {providerId && (
                   <input type="hidden" name="providerId" value={providerId} />
                 )}
