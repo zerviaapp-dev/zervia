@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 import { Link } from '@/i18n/routing';
 import { Panel } from '@/components/Panel';
 import { NotConfigured } from '@/components/auth/NotConfigured';
+import { DataLoadError } from '@/components/admin/DataLoadError';
 import { createClient } from '@/lib/supabase/server';
 import { localizedPath } from '@/lib/locale-path';
 import { countryName } from '@/lib/countries';
@@ -59,16 +60,34 @@ export default async function AdminProvidersPage({
     redirect(localizedPath('/app/dashboard', locale));
   }
 
-  const { data } = (await supabase
-    .from('providers')
-    .select(
-      'id, business_name, category, description, country, city, phone, whatsapp, status, id_document_path, created_at, profiles!inner(full_name, email)'
-    )
-    .eq('status', 'pending')
-    .order('created_at', { ascending: true })) as {
-    data: PendingProvider[] | null;
-  };
-  const queue = data ?? [];
+  let queue: PendingProvider[] = [];
+  let loadError = false;
+  try {
+    const { data, error } = (await supabase
+      .from('providers')
+      .select(
+        'id, business_name, category, description, country, city, phone, whatsapp, status, id_document_path, created_at, profiles!inner(full_name, email)'
+      )
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })) as {
+      data: PendingProvider[] | null;
+      error: unknown;
+    };
+    if (error) throw error;
+    queue = data ?? [];
+  } catch (e) {
+    console.error('[admin/providers] failed to load provider queue:', e);
+    loadError = true;
+  }
+
+  if (loadError) {
+    return (
+      <div className="space-y-5">
+        <h1 className="text-3xl font-bold text-brand-900">{t('adminTitle')}</h1>
+        <DataLoadError />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-5">
