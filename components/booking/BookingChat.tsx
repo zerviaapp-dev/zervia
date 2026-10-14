@@ -6,6 +6,7 @@ import { useLocale, useTranslations } from 'next-intl';
 import { createClient } from '@/lib/supabase/client';
 import { sendMessage, markMessagesSeen } from '@/lib/supabase/message-actions';
 import { Panel } from '@/components/Panel';
+import { QuickReplies } from '@/components/booking/QuickReplies';
 
 export type ChatMessage = {
   id: string;
@@ -28,11 +29,14 @@ export function BookingChat({
   initialMessages,
   currentUserId,
   counterpartyName,
+  isProvider = false,
 }: {
   bookingId: string;
   initialMessages: ChatMessage[];
   currentUserId: string;
   counterpartyName: string;
+  /** When true, show the provider's quick-reply template chips. */
+  isProvider?: boolean;
 }) {
   const t = useTranslations('Bookings');
   const locale = useLocale();
@@ -204,6 +208,14 @@ export function BookingChat({
         <p className="mt-1 text-right text-xs font-medium text-brand-500">
           ✓✓ {t('chatSeen')}
         </p>
+      ) : null}
+
+      {isProvider ? (
+        <QuickReplies
+          onPick={(text) =>
+            setDraft((prev) => (prev.trim() ? `${prev}\n${text}` : text))
+          }
+        />
       ) : null}
 
       <form action={formAction} className="mt-3 flex gap-2">
