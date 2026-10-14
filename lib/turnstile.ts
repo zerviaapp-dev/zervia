@@ -30,6 +30,12 @@ export async function verifyTurnstile(
 ): Promise<TurnstileResult> {
   const secret = process.env.TURNSTILE_SECRET_KEY;
 
+  // Temporary bypass for testing (set DISABLE_TURNSTILE=true in Vercel).
+  // Remove after test transaction is complete.
+  if (process.env.DISABLE_TURNSTILE === 'true') {
+    return { ok: true };
+  }
+
   if (!secret) {
     if (process.env.NODE_ENV === 'production') {
       // FAIL CLOSED: never silently unprotected in production.
