@@ -1,5 +1,6 @@
 import type { MetadataRoute } from 'next';
 import { locales, defaultLocale } from '@/lib/locales';
+import { DIGITAL_PRODUCT_SLUGS } from '@/lib/digital-products';
 
 /**
  * /sitemap.xml — public marketing pages in every locale.
@@ -7,8 +8,22 @@ import { locales, defaultLocale } from '@/lib/locales';
  * Auth/app/API routes are excluded (gated, not for crawlers).
  */
 export default function sitemap(): MetadataRoute.Sitemap {
-  const base = 'https://zervia-app-deploy.vercel.app';
-  const pages = ['/', '/discover', '/pricing', '/terms', '/privacy', '/refunds'];
+  const base = 'https://zervia.app';
+  const pages = [
+    '/',
+    '/discover',
+    '/services',
+    '/providers',
+    '/pricing',
+    '/products',
+    '/why-zervia',
+    '/guarantee',
+    '/provider-agreement',
+    '/support',
+    '/terms',
+    '/privacy',
+    '/refunds',
+  ];
 
   const entries: MetadataRoute.Sitemap = [];
   for (const locale of locales) {
@@ -18,7 +33,16 @@ export default function sitemap(): MetadataRoute.Sitemap {
         url: `${base}${prefix}${page === '/' ? '' : page}`,
         lastModified: new Date(),
         changeFrequency: page === '/' ? 'weekly' : 'monthly',
-        priority: page === '/' ? 1 : 0.7,
+        priority: page === '/' ? 1 : page === '/products' ? 0.8 : 0.7,
+      });
+    }
+    // Digital product detail pages.
+    for (const slug of DIGITAL_PRODUCT_SLUGS) {
+      entries.push({
+        url: `${base}${prefix}/products/${slug}`,
+        lastModified: new Date(),
+        changeFrequency: 'monthly',
+        priority: 0.6,
       });
     }
   }
