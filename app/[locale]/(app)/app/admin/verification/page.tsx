@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 import { Link } from '@/i18n/routing';
 import { Panel } from '@/components/Panel';
 import { NotConfigured } from '@/components/auth/NotConfigured';
+import { DataLoadError } from '@/components/admin/DataLoadError';
 import { VerificationQueueActions } from '@/components/verification/VerificationQueueActions';
 import { createClient } from '@/lib/supabase/server';
 import { localizedPath } from '@/lib/locale-path';
@@ -55,15 +56,34 @@ export default async function AdminVerificationPage({
     redirect(localizedPath('/app/dashboard', locale));
   }
 
-  const { data } = (await supabase
-    .from('verification_documents')
-    .select(
-      'id, provider_id, doc_type, storage_path, status, created_at, providers!inner(business_name, trust_level, profiles!providers_user_id_fkey(full_name, email))'
-    )
-    .eq('status', 'pending')
-    .order('created_at', { ascending: true })) as { data: QueueItem[] | null };
+  let queue: QueueItem[] = [];
+  let loadError = false;
+  try {
+    const { data, error } = (await supabase
+      .from('verification_documents')
+      .select(
+        'id, provider_id, doc_type, storage_path, status, created_at, providers!inner(business_name, trust_level, profiles!providers_user_id_fkey(full_name, email))'
+      )
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })) as {
+      data: QueueItem[] | null;
+      error: unknown;
+    };
+    if (error) throw error;
+    queue = data ?? [];
+  } catch (e) {
+    console.error('[admin/verification] failed to load verification queue:', e);
+    loadError = true;
+  }
 
-  const queue = data ?? [];
+  if (loadError) {
+    return (
+      <div className="space-y-5">
+        <h1 className="text-3xl font-bold text-brand-900">{t('queueTitle')}</h1>
+        <DataLoadError />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-5">
