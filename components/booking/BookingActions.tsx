@@ -17,10 +17,16 @@ export function BookingActions({
   bookingId,
   role,
   status,
+  releaseAmount,
+  releaseCurrency,
 }: {
   bookingId: string;
   role: 'customer' | 'provider';
   status: string;
+  /** Amount (in cents) that will be released on completion — shown in the confirm dialog. */
+  releaseAmount?: number | null;
+  /** Currency code for the release amount (e.g. 'cad'). */
+  releaseCurrency?: string | null;
 }) {
   const t = useTranslations('Bookings');
   const locale = useLocale();
@@ -61,6 +67,23 @@ export function BookingActions({
     );
   }
 
+  // Money-aware completion confirmation: show the exact amount being
+  // released so the provider understands the financial consequence.
+  const releaseLabel =
+    releaseAmount != null && releaseAmount > 0
+      ? new Intl.NumberFormat(locale, {
+          style: 'currency',
+          currency: (releaseCurrency ?? 'cad').toUpperCase(),
+        }).format(releaseAmount / 100)
+      : null;
+  const completeConfirmMessage = releaseLabel
+    ? t('completeConfirmWithAmount', { amount: releaseLabel })
+    : t('completeConfirm');
+  // Cancel confirmation: tell the customer their money comes back.
+  const cancelConfirmMessage = releaseLabel
+    ? t('cancelConfirmWithRefund', { amount: releaseLabel })
+    : t('cancelConfirm');
+
   return (
     <div className="flex flex-wrap gap-3">
       {role === 'customer' &&
@@ -69,7 +92,7 @@ export function BookingActions({
           target="cancelled"
           label={t('cancelBooking')}
           className={danger}
-          confirmMessage={t('cancelConfirm')}
+          confirmMessage={cancelConfirmMessage}
         />
       ) : null}
       {role === 'provider' && status === 'pending' ? (
@@ -83,7 +106,7 @@ export function BookingActions({
             target="cancelled"
             label={t('declineBooking')}
             className={danger}
-            confirmMessage={t('cancelConfirm')}
+            confirmMessage={cancelConfirmMessage}
           />
         </>
       ) : null}
@@ -98,7 +121,7 @@ export function BookingActions({
             target="cancelled"
             label={t('cancelBooking')}
             className={danger}
-            confirmMessage={t('cancelConfirm')}
+            confirmMessage={cancelConfirmMessage}
           />
         </>
       ) : null}
@@ -108,13 +131,13 @@ export function BookingActions({
             target="completed"
             label={t('markCompleted')}
             className={subtle}
-            confirmMessage={t('completeConfirm')}
+            confirmMessage={completeConfirmMessage}
           />
           <StatusForm
             target="cancelled"
             label={t('cancelBooking')}
             className={danger}
-            confirmMessage={t('cancelConfirm')}
+            confirmMessage={cancelConfirmMessage}
           />
         </>
       ) : null}
