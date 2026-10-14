@@ -13,7 +13,14 @@ import { uploadIdDocument } from '@/lib/supabase/storage';
  * The component never displays the document after upload: it shows only
  * a "received" confirmation, so shoulder-surfers see nothing sensitive.
  */
-export function IdUploader({ alreadyProvided }: { alreadyProvided: boolean }) {
+export function IdUploader({
+  alreadyProvided,
+  onUploaded,
+}: {
+  alreadyProvided: boolean;
+  /** Called when an upload completes successfully (for mandatory-ID flows). */
+  onUploaded?: () => void;
+}) {
   const t = useTranslations('Moderation');
   const [done, setDone] = useState(alreadyProvided);
   const [busy, setBusy] = useState(false);
@@ -28,13 +35,23 @@ export function IdUploader({ alreadyProvided }: { alreadyProvided: boolean }) {
     setError('');
     const fd = new FormData();
     fd.append('idDocument', file);
-    const res = await uploadIdDocument(fd);
-    setBusy(false);
-    if (!res.ok) {
-      setError(t(res.message));
-      return;
+    try {
+      // Timeout after 30s — uploads should never hang silently
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('timeout')), 30000)
+      );
+      const res = await Promise.race([uploadIdDocument(fd), timeout]);
+      setBusy(false);
+      if (!res.ok) {
+        setError(t(res.message));
+        return;
+      }
+      setDone(true);
+      onUploaded?.();
+    } catch {
+      setBusy(false);
+      setError(t('errorUploadFailed'));
     }
-    setDone(true);
   }
 
   return (
