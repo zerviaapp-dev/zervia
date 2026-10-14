@@ -45,32 +45,47 @@ export type BookingCardItem = {
   counterparty: string | null;
 };
 
-/** One booking row linking to its detail page. */
+/** One booking row linking to its detail page, with optional one-tap rebook. */
 export function BookingCard({
   booking,
   statusLabel,
   scheduledText,
+  rebookLabel,
 }: {
   booking: BookingCardItem;
   statusLabel: string;
   scheduledText: string;
+  /** Shown for completed bookings: one-tap rebook (anti-disintermediation). */
+  rebookLabel?: string;
 }) {
+  const canRebook =
+    rebookLabel && booking.status === 'completed' && booking.listings?.id;
   return (
-    <Link href={`/app/bookings/${booking.id}`} className="block">
-      <Panel>
-        <div className="flex flex-wrap items-start justify-between gap-2">
-          <p className="text-lg font-bold text-brand-900">
-            {booking.listings?.title ?? '—'}
-          </p>
-          <StatusChip status={booking.status} label={statusLabel} />
-        </div>
-        {booking.counterparty ? (
-          <p className="mt-1 text-sm font-semibold text-brand-700">
-            {booking.counterparty}
-          </p>
-        ) : null}
-        <p className="mt-1 text-sm text-brand-500">{scheduledText}</p>
-      </Panel>
-    </Link>
+    <div>
+      <Link href={`/app/bookings/${booking.id}`} className="block">
+        <Panel>
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <p className="text-lg font-bold text-brand-900">
+              {booking.listings?.title ?? '—'}
+            </p>
+            <StatusChip status={booking.status} label={statusLabel} />
+          </div>
+          {booking.counterparty ? (
+            <p className="mt-1 text-sm font-semibold text-brand-700">
+              {booking.counterparty}
+            </p>
+          ) : null}
+          <p className="mt-1 text-sm text-brand-500">{scheduledText}</p>
+        </Panel>
+      </Link>
+      {canRebook ? (
+        <Link
+          href={`/listings/${booking.listings!.id}/book/new`}
+          className="mt-2 inline-flex min-h-[48px] items-center justify-center gap-2 rounded-full bg-brand-600 px-6 font-semibold text-white hover:bg-brand-700"
+        >
+          <span aria-hidden="true">↻</span> {rebookLabel}
+        </Link>
+      ) : null}
+    </div>
   );
 }
