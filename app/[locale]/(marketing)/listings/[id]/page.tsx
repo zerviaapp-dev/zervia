@@ -5,6 +5,12 @@ import { Panel } from '@/components/Panel';
 import { TrustBadge, type TrustLevel } from '@/components/TrustBadge';
 import { NotConfigured } from '@/components/auth/NotConfigured';
 import { ReportButton } from '@/components/moderation/ReportButton';
+import { PaymentProtectedBadge } from '@/components/PaymentProtectedBadge';
+import { SafetyBanner } from '@/components/SafetyBanner';
+import { InstantQuote } from '@/components/booking/InstantQuote';
+import { AuditedBadge } from '@/components/provider/AuditedBadge';
+import { VerificationBadges } from '@/components/provider/VerificationBadges';
+import { getProviderBadges, type BadgeKey } from '@/lib/provider-badges';
 import { createClient } from '@/lib/supabase/server';
 import { countryName } from '@/lib/countries';
 import { localeNames, type Locale } from '@/lib/locales';
@@ -28,6 +34,8 @@ type DetailListing = {
     description: string | null;
     verified: boolean;
     verification_badge: boolean | null;
+    // NOTE: requires migration 0035; null-safe until applied.
+    audited_until: string | null;
     trust_level: TrustLevel;
     completed_jobs: number | null;
     phone: string | null;
@@ -38,6 +46,11 @@ type DetailListing = {
     rating_avg: number | null;
     review_count: number | null;
     avg_response_minutes: number | null;
+    // Badge columns (null-safe until migrations applied).
+    id_verified?: boolean | null;
+    background_check_passed?: boolean | null;
+    pro_verified?: boolean | null;
+    created_at?: string | null;
   } | null;
 };
 
@@ -46,6 +59,14 @@ type ReviewItem = {
   rating: number;
   text: string | null;
   created_at: string;
+  // NOTE: requires migration 0029; null-safe until applied.
+  photo_urls: string[] | null;
+};
+
+type PortfolioItem = {
+  id: string;
+  photo_url: string;
+  caption: string | null;
 };
 
 /**
@@ -62,6 +83,21 @@ export default async function ListingDetailPage({
   const t = await getTranslations({ locale, namespace: 'Discover' });
   const tc = await getTranslations({ locale, namespace: 'Categories' });
   const tp = await getTranslations({ locale, namespace: 'Provider' });
+  const bt = await getTranslations({ locale, namespace: 'ProviderBadges' });
+  const badgeLabels = {
+    id_verified: bt('id_verified'),
+    background_checked: bt('background_checked'),
+    top_rated: bt('top_rated'),
+    founding_provider: bt('founding_provider'),
+    pro_verified: bt('pro_verified'),
+  } as Record<BadgeKey, string>;
+  const badgeHints = {
+    id_verified: bt('id_verifiedHint'),
+    background_checked: bt('background_checkedHint'),
+    top_rated: bt('top_ratedHint'),
+    founding_provider: bt('founding_providerHint'),
+    pro_verified: bt('pro_verifiedHint'),
+  } as Record<BadgeKey, string>;
   const ts = await getTranslations({ locale, namespace: 'Subcategories' });
   const tb = await getTranslations({ locale, namespace: 'Bookings' });
   const supabase = await createClient();
@@ -70,13 +106,28 @@ export default async function ListingDetailPage({
     return <NotConfigured />;
   }
 
-  const { data } = (await supabase
+  const SELECT_FULL =
+    'id, title, description, category, subcategory, price_cents, price_type, country, city, status, photos, providers!inner(id, business_name, description, verified, verification_badge, audited_until, trust_level, completed_jobs, phone, whatsapp, city, country, languages, rating_avg, review_count, avg_response_minutes, id_verified, background_check_passed, pro_verified, created_at)';
+  const SELECT_MINIMAL =
+    'id, title, description, category, price_cents, price_type, country, city, status, providers!inner(id, business_name, verified, rating_avg, review_count, city, country, created_at)';
+
+  let queryResult = (await supabase
     .from('listings')
-    .select(
-      'id, title, description, category, subcategory, price_cents, price_type, country, city, status, photos, providers!inner(id, business_name, description, verified, verification_badge, trust_level, completed_jobs, phone, whatsapp, city, country, languages, rating_avg, review_count, avg_response_minutes)'
-    )
+    .select(SELECT_FULL)
     .eq('id', id)
-    .maybeSingle()) as { data: DetailListing | null };
+    .maybeSingle()) as { data: DetailListing | null; error: { code?: string } | null };
+
+  // Fallback to minimal columns if optional badge/trust columns are missing
+  // (PGRST204 schema cache miss or 42703 undefined column).
+  if (queryResult.error && ['42703', 'PGRST204'].includes(queryResult.error.code || '')) {
+    queryResult = (await supabase
+      .from('listings')
+      .select(SELECT_MINIMAL)
+      .eq('id', id)
+      .maybeSingle()) as { data: DetailListing | null; error: { code?: string } | null };
+  }
+
+  const { data } = queryResult;
 
   if (!data) {
     notFound();
@@ -101,12 +152,29 @@ export default async function ListingDetailPage({
   const viewerCurrency = currencyForCountry(viewerCountry);
 
   // Public reviews for this provider (RLS: public read), newest first.
+  // NOTE: photo_urls requires migration 0029; a failed select degrades to
+  // "no reviews", same as before.
   const { data: reviews } = (await supabase
     .from('reviews')
-    .select('id, rating, text, created_at')
+    .select('id, rating, text, created_at, photo_urls')
     .eq('provider_id', data.providers?.id ?? '')
     .order('created_at', { ascending: false })
     .limit(10)) as { data: ReviewItem[] | null };
+
+  // Public portfolio: the provider's past-work gallery (migration 0029).
+  let portfolio: PortfolioItem[] = [];
+  try {
+    const { data: pf } = (await supabase
+      .from('portfolio_items')
+      .select('id, photo_url, caption')
+      .eq('provider_id', data.providers?.id ?? '')
+      .order('sort_order', { ascending: true })
+      .order('created_at', { ascending: true })
+      .limit(12)) as { data: PortfolioItem[] | null };
+    portfolio = pf ?? [];
+  } catch {
+    portfolio = [];
+  }
 
   const provider = data.providers;
   const whatsappHref = provider?.whatsapp
@@ -153,7 +221,9 @@ export default async function ListingDetailPage({
     <div className="space-y-5">
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(serviceJsonLd) }}
+        // Escape `<` so a listing title/description containing `</script>`
+        // can never break out of this tag (stored-XSS hardening).
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(serviceJsonLd).replace(/</g, '\\u003c') }}
       />
       <Link
         href="/discover"
@@ -161,6 +231,11 @@ export default async function ListingDetailPage({
       >
         ← {t('backToDiscover')}
       </Link>
+
+      {/* Anti-scammer safety banner for buy/sell & rental listings */}
+      {['buy_sell', 'room_rentals', 'house_rent', 'basement_suite', 'apartment_condo'].includes(data.category) ? (
+        <SafetyBanner locale={locale} />
+      ) : null}
 
       <div
         className="flex h-48 items-center justify-center overflow-hidden rounded-3xl bg-brand-50"
@@ -170,7 +245,7 @@ export default async function ListingDetailPage({
           // eslint-disable-next-line @next/next/no-img-element
           <img
             src={photos[0]}
-            alt=""
+            alt={`${data.title} — service photo`}
             className="h-full w-full object-cover"
           />
         ) : (
@@ -183,7 +258,7 @@ export default async function ListingDetailPage({
           {photos.slice(1, 5).map((url) => (
             <div key={url} role="listitem" className="overflow-hidden rounded-2xl">
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={url} alt="" className="aspect-square w-full object-cover" loading="lazy" />
+              <img src={url} alt={`${data.title} — photo`} className="aspect-square w-full object-cover" loading="lazy" />
             </div>
           ))}
         </div>
@@ -227,6 +302,14 @@ export default async function ListingDetailPage({
         </Panel>
       ) : null}
 
+      {/* Instant price estimate before messaging the provider. */}
+      <InstantQuote
+        category={data.category}
+        priceCents={data.price_cents}
+        priceType={data.price_type}
+        currency={currencyForCountry(data.country)}
+      />
+
       {provider ? (
         <Panel>
           <h2 className="text-xl font-bold text-brand-900">{t('aboutProvider')}</h2>
@@ -236,8 +319,18 @@ export default async function ListingDetailPage({
               <span className="inline-flex items-center rounded-full bg-green-100 px-3 py-0.5 text-sm font-bold text-green-800">
                 ✓ {t('verifiedBadge')}
               </span>
-            ) : null}
+            ) : null}{' '}
+            <AuditedBadge auditedUntil={provider.audited_until} locale={locale} size="md" />
           </p>
+          <div className="mt-2">
+            <VerificationBadges
+              badges={getProviderBadges(provider)}
+              labels={badgeLabels}
+              hints={badgeHints}
+              max={5}
+              size="md"
+            />
+          </div>
           <TrustBadge
             level={provider.trust_level ?? 'new'}
             ratingAvg={provider.rating_avg}
@@ -269,6 +362,27 @@ export default async function ListingDetailPage({
                 .join(', ')}
             </p>
           ) : null}
+          {portfolio.length > 0 ? (
+            <div className="mt-4">
+              <h3 className="text-base font-bold text-brand-900">{tp('portfolioPastWork')}</h3>
+              <ul className="mt-2 grid grid-cols-3 gap-2">
+                {portfolio.map((item) => (
+                  <li key={item.id} className="overflow-hidden rounded-2xl border border-brand-100">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={item.photo_url}
+                      alt={item.caption || tp('portfolioPhotoAlt')}
+                      className="aspect-square w-full object-cover"
+                      loading="lazy"
+                    />
+                    {item.caption ? (
+                      <p className="truncate px-2 py-1 text-xs text-brand-700">{item.caption}</p>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
           <div className="mt-4 flex flex-wrap gap-2">
             <Link
               href={`/listings/${data.id}/book/new`}
@@ -296,6 +410,9 @@ export default async function ListingDetailPage({
             ) : null}
           </div>
           <p className="mt-3 text-xs text-brand-500">{tb('bookingCtaNote')}</p>
+          <div className="mt-4">
+            <PaymentProtectedBadge locale={locale} variant="banner" />
+          </div>
         </Panel>
       ) : null}
 
@@ -317,6 +434,21 @@ export default async function ListingDetailPage({
                   <p className="mt-1 whitespace-pre-wrap text-base text-brand-800">
                     {r.text}
                   </p>
+                ) : null}
+                {(r.photo_urls ?? []).length > 0 ? (
+                  <ul className="mt-2 grid grid-cols-3 gap-2">
+                    {(r.photo_urls ?? []).slice(0, 3).map((url) => (
+                      <li key={url} className="overflow-hidden rounded-xl border border-brand-100">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={url}
+                          alt={tb('reviewPhotoAlt')}
+                          className="aspect-square w-full object-cover"
+                          loading="lazy"
+                        />
+                      </li>
+                    ))}
+                  </ul>
                 ) : null}
                 <p className="mt-1 text-xs text-brand-500">
                   {new Date(r.created_at).toLocaleDateString(locale, {
