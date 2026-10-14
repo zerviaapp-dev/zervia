@@ -11,6 +11,17 @@ export function isStripeConfigured(): boolean {
   return Boolean(process.env.STRIPE_SECRET_KEY);
 }
 
+/**
+ * Whether Stripe is running in TEST mode. Derived from the secret key
+ * prefix (sk_test_…) — the single source of truth, so customer-facing
+ * "test mode" labels can never leak into a live-money deployment by
+ * forgetting to flip a flag.
+ */
+export function isStripeTestMode(): boolean {
+  const key = process.env.STRIPE_SECRET_KEY ?? '';
+  return key.startsWith('sk_test_');
+}
+
 let stripeInstance: Stripe | null = null;
 
 /**
