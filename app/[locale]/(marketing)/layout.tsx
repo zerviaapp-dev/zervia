@@ -44,6 +44,18 @@ export default async function MarketingLayout({
               {t('navPricing')}
             </Link>
             <Link
+              href="/providers"
+              className="inline-flex min-h-[44px] items-center rounded-full px-4 text-brand-700 hover:bg-brand-50"
+            >
+              {t('navProviders')}
+            </Link>
+            <Link
+              href="/products"
+              className="inline-flex min-h-[44px] items-center rounded-full px-4 text-brand-700 hover:bg-brand-50"
+            >
+              {t('navLearn')}
+            </Link>
+            <Link
               href="/login"
               className="inline-flex min-h-[44px] items-center rounded-full bg-brand-600 px-5 text-white hover:bg-brand-700"
             >
@@ -62,6 +74,9 @@ export default async function MarketingLayout({
             <p className="text-sm text-slate-500">{t('footerNote')}</p>
           </div>
           <nav className="flex items-center gap-4 text-sm font-medium text-brand-700">
+            <Link href="/providers" className="hover:underline">
+              {t('navProviders')}
+            </Link>
             <Link href="/support" className="hover:underline">
               {t('footerSupport')}
             </Link>
