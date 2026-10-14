@@ -12,9 +12,19 @@ import { QuoteForm } from '@/components/booking/QuoteForm';
 import { PaymentPanel } from '@/components/booking/PaymentPanel';
 import { DisputeResolutionPanel } from '@/components/booking/DisputeResolutionPanel';
 import { ReworkForm } from '@/components/booking/ReworkForm';
+import { PostServiceSurvey } from '@/components/booking/PostServiceSurvey';
+import { SectionErrorBoundary } from '@/components/booking/SectionErrorBoundary';
 import { createClient } from '@/lib/supabase/server';
+import { isStripeTestMode } from '@/lib/stripe';
 import { localizedPath } from '@/lib/locale-path';
 import { asCurrency, currencyForCountry, formatCurrency } from '@/lib/currency';
+import {
+  platformFeeBps,
+  platformFeeCents,
+  providerNetCents,
+  isMemberSubscription,
+  isAuditBadgeValid,
+} from '@/lib/pricing';
 
 type DetailBooking = {
   id: string;
@@ -24,14 +34,14 @@ type DetailBooking = {
   scheduled_at: string | null;
   status: 'pending' | 'confirmed' | 'in_progress' | 'completed' | 'cancelled' | 'disputed';
   notes: string | null;
-  dispute_reason: string | null;
-  review_requested_at: string | null;
-  agreed_price_cents: number | null;
-  completed_at: string | null;
-  rework_requested_at: string | null;
+  dispute_reason?: string | null;
+  review_requested_at?: string | null;
+  agreed_price_cents?: number | null;
+  completed_at?: string | null;
+  rework_requested_at?: string | null;
   created_at: string;
   listings: { id: string; title: string; price_cents: number | null; price_type: string } | null;
-  providers: { business_name: string; user_id: string; country: string | null } | null;
+  providers: { business_name: string; user_id: string; country: string | null; audited_until?: string | null } | null;
   customer: { display_name: string } | null;
 };
 
@@ -74,13 +84,28 @@ export default async function BookingDetailPage({
     redirect(localizedPath('/login', locale));
   }
 
-  const { data: booking } = (await supabase
+  const SELECT_FULL =
+    'id, listing_id, customer_id, provider_id, scheduled_at, status, notes, dispute_reason, review_requested_at, agreed_price_cents, completed_at, rework_requested_at, created_at, listings(id, title, price_cents, price_type), providers(business_name, user_id, country, audited_until), customer:profiles!bookings_customer_id_fkey(display_name)';
+  const SELECT_MINIMAL =
+    'id, listing_id, customer_id, provider_id, scheduled_at, status, notes, created_at, listings(id, title, price_cents, price_type), providers(business_name, user_id, country), customer:profiles!bookings_customer_id_fkey(display_name)';
+
+  let bookingResult = (await supabase
     .from('bookings')
-    .select(
-      'id, listing_id, customer_id, provider_id, scheduled_at, status, notes, dispute_reason, review_requested_at, agreed_price_cents, completed_at, rework_requested_at, created_at, listings(id, title, price_cents, price_type), providers(business_name, user_id, country), customer:profiles!bookings_customer_id_fkey(display_name)'
-    )
+    .select(SELECT_FULL)
     .eq('id', id)
-    .maybeSingle()) as { data: DetailBooking | null };
+    .maybeSingle()) as { data: DetailBooking | null; error: { code?: string } | null };
+
+  // Fallback to minimal columns if optional columns are missing
+  // (PGRST204 schema cache miss or 42703 undefined column).
+  if (bookingResult.error && ['42703', 'PGRST204'].includes(bookingResult.error.code || '')) {
+    bookingResult = (await supabase
+      .from('bookings')
+      .select(SELECT_MINIMAL)
+      .eq('id', id)
+      .maybeSingle()) as { data: DetailBooking | null; error: { code?: string } | null };
+  }
+
+  const { data: booking } = bookingResult;
 
   // Not found OR not yours: same response, never a hint it exists.
   if (!booking) {
@@ -109,6 +134,13 @@ export default async function BookingDetailPage({
     .select('id, rating, text, created_at')
     .eq('booking_id', booking.id)
     .maybeSingle()) as { data: ReviewRow | null };
+
+  // Required post-service survey (CEO decision): one per booking.
+  const { data: survey } = (await supabase
+    .from('post_service_surveys')
+    .select('id')
+    .eq('booking_id', booking.id)
+    .maybeSingle()) as { data: { id: string } | null };
 
   // Chat thread + quotes (RLS admits only the parties).
   const { data: messages } = (await supabase
@@ -157,9 +189,12 @@ export default async function BookingDetailPage({
 
   const canDispute =
     (isCustomer || isProvider) &&
-    ['pending', 'confirmed'].includes(booking.status);
+    ['pending', 'confirmed', 'in_progress'].includes(booking.status);
   const canReview =
     isCustomer && booking.status === 'completed' && !review;
+  // Required survey: customer, completed booking, no survey submitted yet.
+  const canSurvey =
+    isCustomer && booking.status === 'completed' && !survey;
 
   // Escrow payment state (RLS admits the parties; admins see it too).
   const { data: escrow } = (await supabase
@@ -187,6 +222,27 @@ export default async function BookingDetailPage({
   // charge currency once a payment exists.
   const priceCurrency = currencyForCountry(booking.providers?.country ?? null);
   const escrowCurrency = asCurrency(escrow?.currency ?? null);
+
+  // Platform fee transparency: providers see the fee breakdown BEFORE
+  // accepting/completing. Free providers pay 10%, members pay 5%.
+  // A valid 🏅 Audited badge lowers it to 8% / 4% (see lib/pricing.ts).
+  let providerIsMember = false;
+  let providerIsAudited = false;
+  let feeBps = 0;
+  let feeCents = 0;
+  let netCents = 0;
+  if (role === 'provider' && payableAmount != null && payableAmount > 0) {
+    const { data: sub } = await supabase
+      .from('subscriptions')
+      .select('tier, status')
+      .eq('provider_id', booking.provider_id)
+      .maybeSingle();
+    providerIsMember = isMemberSubscription(sub);
+    providerIsAudited = isAuditBadgeValid(booking.providers?.audited_until ?? null);
+    feeBps = platformFeeBps(providerIsMember, providerIsAudited);
+    feeCents = platformFeeCents(payableAmount, providerIsMember, providerIsAudited);
+    netCents = providerNetCents(payableAmount, providerIsMember, providerIsAudited);
+  }
 
   // 48-hour rework window after completion.
   const completedAtMs = booking.completed_at
@@ -249,7 +305,7 @@ export default async function BookingDetailPage({
               })}
             </dd>
           </div>
-          {booking.agreed_price_cents !== null ? (
+          {booking.agreed_price_cents != null ? (
             <div className="flex justify-between gap-4">
               <dt className="font-semibold text-brand-900">
                 {t('agreedPriceLabel')}
@@ -258,6 +314,42 @@ export default async function BookingDetailPage({
                 {formatCurrency(booking.agreed_price_cents, priceCurrency, locale)}
               </dd>
             </div>
+          ) : null}
+          {/* Platform fee breakdown — visible to providers for transparency
+              before they accept or complete the booking. */}
+          {role === 'provider' && payableAmount != null && payableAmount > 0 ? (
+            <>
+              <div className="flex justify-between gap-4">
+                <dt className="font-semibold text-brand-900">
+                  {t('platformFeeLabel', { percent: feeBps / 100 })}
+                </dt>
+                <dd className="text-brand-800">
+                  −{formatCurrency(feeCents, priceCurrency, locale)}
+                </dd>
+              </div>
+              <div className="flex justify-between gap-4">
+                <dt className="font-semibold text-brand-900">
+                  {t('youKeepLabel')}
+                </dt>
+                <dd className="text-lg font-bold text-green-700">
+                  {formatCurrency(netCents, priceCurrency, locale)}
+                </dd>
+              </div>
+              {!providerIsMember ? (
+                <p className="text-sm text-brand-600">
+                  {t('memberFeeHint', { percent: 5 })}
+                </p>
+              ) : null}
+              {providerIsAudited ? (
+                <p className="text-sm font-semibold text-amber-700">
+                  🏅 {t('auditedFeeHint')}
+                </p>
+              ) : (
+                <p className="text-sm text-brand-600">
+                  {t('auditFeeHint', { percent: providerIsMember ? 4 : 8 })}
+                </p>
+              )}
+            </>
           ) : null}
         </dl>
         {booking.notes ? (
@@ -334,10 +426,13 @@ export default async function BookingDetailPage({
         bookingId={booking.id}
         role={role}
         status={booking.status}
+        releaseAmount={payableAmount}
+        releaseCurrency={priceCurrency}
       />
 
       {/* Held-payment escrow (TEST MODE) */}
       {(isCustomer || isProvider) ? (
+        <SectionErrorBoundary>
         <PaymentPanel
           bookingId={booking.id}
           role={role}
@@ -346,7 +441,10 @@ export default async function BookingDetailPage({
           amountCents={escrow?.amount_cents ?? payableAmount}
           amountCurrency={escrow ? escrowCurrency : priceCurrency}
           canPay={canPay}
+          walletsReady={process.env.STRIPE_WALLETS_ENABLED === 'true'}
+          testMode={isStripeTestMode()}
         />
+        </SectionErrorBoundary>
       ) : null}
 
       {/* Admin dispute mediation: release or refund the held payment */}
@@ -385,12 +483,15 @@ export default async function BookingDetailPage({
       {['pending', 'confirmed', 'in_progress', 'completed', 'disputed'].includes(
         booking.status
       ) ? (
+        <SectionErrorBoundary>
         <BookingChat
           bookingId={booking.id}
           initialMessages={messages ?? []}
           currentUserId={user.id}
           counterpartyName={counterpartyName}
+          isProvider={role === 'provider'}
         />
+        </SectionErrorBoundary>
       ) : null}
 
       {canDispute ? (
@@ -402,6 +503,29 @@ export default async function BookingDetailPage({
         </Link>
       ) : null}
 
+      {/* REQUIRED post-service survey: the primary CTA after completion.
+          The optional public review link stays below, but the survey comes
+          first and is rendered inline (not just a link). */}
+      {canSurvey ? (
+        <Panel>
+          <p className="text-sm font-semibold uppercase tracking-wide text-brand-500">
+            {t('surveyTitle')}
+          </p>
+          <p className="mt-1 text-base font-medium text-brand-800">
+            {t('surveyRequired')}
+          </p>
+          <p className="mt-1 text-sm text-brand-600">{t('surveyDescription')}</p>
+          <div className="mt-4">
+            <PostServiceSurvey bookingId={booking.id} />
+          </div>
+        </Panel>
+      ) : null}
+      {isCustomer && booking.status === 'completed' && survey ? (
+        <p className="text-base font-medium text-green-700">
+          ✓ {t('surveyCompletedNote')}
+        </p>
+      ) : null}
+
       {/* Review */}
       {canReview ? (
         <Link
@@ -409,6 +533,20 @@ export default async function BookingDetailPage({
           className="inline-flex min-h-[56px] items-center justify-center rounded-full bg-amber-400 px-8 text-base font-bold text-brand-900 hover:bg-amber-500"
         >
           ⭐ {t('leaveReview')}
+        </Link>
+      ) : null}
+      {/* One-tap rebook: completed jobs can be booked again with the
+          same provider/service; previous notes are pre-filled. */}
+      {isCustomer && booking.status === 'completed' && booking.listing_id ? (
+        <Link
+          href={`/listings/${booking.listing_id}/book/new${
+            booking.notes
+              ? `?notes=${encodeURIComponent(booking.notes)}`
+              : ''
+          }`}
+          className="inline-flex min-h-[56px] items-center justify-center rounded-full bg-brand-600 px-8 text-base font-semibold text-white hover:bg-brand-700"
+        >
+          🔁 {t('bookAgain')}
         </Link>
       ) : null}
       {/* Provider nudge: ask the customer for a review (one nudge max). */}
