@@ -2,7 +2,8 @@
 
 import { useActionState } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
-import { requestDataAction, type ActionResult } from '@/lib/supabase/moderation-actions';
+import { requestDataAction} from '@/lib/supabase/moderation-actions';
+import type { ActionResult } from '@/lib/supabase/actions';
 import { SubmitButton } from '@/components/auth/SubmitButton';
 
 const initialState: ActionResult = { ok: false, message: '' };
