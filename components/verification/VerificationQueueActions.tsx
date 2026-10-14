@@ -5,6 +5,7 @@ import { useTranslations } from 'next-intl';
 import {
   approveVerification,
   rejectVerification,
+  getVerificationDocUrl,
 } from '@/lib/supabase/verification-actions';
 
 /**
@@ -22,8 +23,21 @@ export function VerificationQueueActions({
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
+  const [viewBusy, setViewBusy] = useState(false);
   const [error, setError] = useState('');
   const [done, setDone] = useState(false);
+
+  async function viewDocument() {
+    setViewBusy(true);
+    setError('');
+    const res = await getVerificationDocUrl(docId);
+    setViewBusy(false);
+    if (!res.ok) {
+      setError(res.message || t('actionFailed'));
+      return;
+    }
+    window.open(res.url, '_blank', 'noopener,noreferrer');
+  }
 
   async function act(action: 'approve' | 'reject') {
     setBusy(true);
@@ -53,6 +67,14 @@ export function VerificationQueueActions({
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap gap-3">
+        <button
+          type="button"
+          onClick={viewDocument}
+          disabled={viewBusy || busy}
+          className="inline-flex min-h-[56px] items-center justify-center rounded-full border-2 border-brand-600 bg-white px-8 text-base font-semibold text-brand-700 hover:bg-brand-50 disabled:opacity-60"
+        >
+          {viewBusy ? '…' : `🪪 ${t('viewDocument', { default: 'View ID' })}`}
+        </button>
         <button
           type="button"
           onClick={() => act('approve')}
