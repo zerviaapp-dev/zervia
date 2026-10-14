@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { Button } from '@/components/Button';
+import { PayPalButton } from '@/components/billing/PayPalButton';
 import { redeemPointsForBoost } from '@/lib/supabase/rewards-actions';
 
 export type BoostListing = {
@@ -22,11 +23,13 @@ export function BoostPurchase({
   listings,
   locale,
   stripeReady,
+  paypalReady,
   boostPriceLabel,
 }: {
   listings: BoostListing[];
   locale: string;
   stripeReady: boolean;
+  paypalReady: boolean;
   /** Localized card price label, e.g. "CA$9.00" / "₱387" — from the server. */
   boostPriceLabel: string;
 }) {
@@ -113,6 +116,9 @@ export function BoostPurchase({
           <Button onClick={payWithCard} disabled={busy !== null} variant="secondary">
             {busy === 'card' ? '…' : boostPriceLabel}
           </Button>
+        ) : null}
+        {paypalReady ? (
+          <PayPalButton kind="boost" listingId={selected} locale={locale} label={t('payWithPayPal', { price: boostPriceLabel })} />
         ) : null}
       </div>
       {message ? (
