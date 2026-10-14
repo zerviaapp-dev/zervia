@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { Button } from '@/components/Button';
 import { CheckoutButton } from '@/components/billing/CheckoutButton';
+import { PayPalButton } from '@/components/billing/PayPalButton';
 
 export type OneTimeListing = {
   id: string;
@@ -24,6 +25,7 @@ export function OneTimePurchases({
   listings,
   locale,
   stripeReady,
+  paypalReady,
   badgeOwned,
   badgePriceLabel,
   featuredWeekPriceLabel,
@@ -33,6 +35,7 @@ export function OneTimePurchases({
   listings: OneTimeListing[];
   locale: string;
   stripeReady: boolean;
+  paypalReady: boolean;
   badgeOwned: boolean;
   badgePriceLabel: string;
   featuredWeekPriceLabel: string;
@@ -60,13 +63,24 @@ export function OneTimePurchases({
             <span className="inline-flex min-h-[56px] items-center rounded-full bg-green-100 px-8 text-lg font-semibold text-green-800">
               ✓ {t('oneTimeOwned')}
             </span>
-          ) : stripeReady ? (
-            <CheckoutButton
-              kind="verification_badge"
-              locale={locale}
-              label={t('oneTimeBuyCta')}
-              highlight
-            />
+          ) : stripeReady || paypalReady ? (
+            <div className="flex flex-wrap gap-2">
+              {stripeReady ? (
+                <CheckoutButton
+                  kind="verification_badge"
+                  locale={locale}
+                  label={t('oneTimeBuyCta')}
+                  highlight
+                />
+              ) : null}
+              {paypalReady ? (
+                <PayPalButton
+                  kind="verification_badge"
+                  locale={locale}
+                  label={t('oneTimeBuyPayPalCta')}
+                />
+              ) : null}
+            </div>
           ) : (
             <span className="text-sm text-brand-600">{t('testMode')}</span>
           )}
@@ -103,17 +117,31 @@ export function OneTimePurchases({
           <p className="text-sm text-brand-600">{t('oneTimeNoListings')}</p>
         )}
         <div className="mt-auto pt-2">
-          {stripeReady && listings.length > 0 ? (
-            <CheckoutButton
-              kind="featured_week"
-              listingId={selected}
-              locale={locale}
-              label={t('oneTimeBuyCta')}
-              highlight
-            />
-          ) : !stripeReady ? (
+          {stripeReady || paypalReady ? (
+            listings.length > 0 ? (
+              <div className="flex flex-wrap gap-2">
+                {stripeReady ? (
+                  <CheckoutButton
+                    kind="featured_week"
+                    listingId={selected}
+                    locale={locale}
+                    label={t('oneTimeBuyCta')}
+                    highlight
+                  />
+                ) : null}
+                {paypalReady ? (
+                  <PayPalButton
+                    kind="featured_week"
+                    listingId={selected}
+                    locale={locale}
+                    label={t('oneTimeBuyPayPalCta')}
+                  />
+                ) : null}
+              </div>
+            ) : null
+          ) : (
             <span className="text-sm text-brand-600">{t('testMode')}</span>
-          ) : null}
+          )}
         </div>
       </div>
 
@@ -130,13 +158,24 @@ export function OneTimePurchases({
             <span className="inline-flex min-h-[56px] items-center rounded-full bg-amber-100 px-8 text-lg font-semibold text-amber-800">
               ✓ {t('oneTimeSpotlightActive', { date: spotlightActiveUntil })}
             </span>
-          ) : stripeReady ? (
-            <CheckoutButton
-              kind="profile_spotlight"
-              locale={locale}
-              label={t('oneTimeBuyCta')}
-              highlight
-            />
+          ) : stripeReady || paypalReady ? (
+            <div className="flex flex-wrap gap-2">
+              {stripeReady ? (
+                <CheckoutButton
+                  kind="profile_spotlight"
+                  locale={locale}
+                  label={t('oneTimeBuyCta')}
+                  highlight
+                />
+              ) : null}
+              {paypalReady ? (
+                <PayPalButton
+                  kind="profile_spotlight"
+                  locale={locale}
+                  label={t('oneTimeBuyPayPalCta')}
+                />
+              ) : null}
+            </div>
           ) : (
             <span className="text-sm text-brand-600">{t('testMode')}</span>
           )}
