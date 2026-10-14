@@ -6,6 +6,7 @@ import { createClient, isSupabaseConfigured } from './server';
 import { defaultLocale } from '@/lib/locales';
 import { localizedPath } from '@/lib/locale-path';
 import type { ActionResult } from './actions';
+import { notifyUser } from './notifications';
 
 async function reviewT(locale: string) {
   return getTranslations({ locale, namespace: 'Bookings' });
@@ -16,8 +17,12 @@ function localeOf(formData: FormData): string {
   return typeof raw === 'string' && raw.length > 0 ? raw : defaultLocale;
 }
 
+/**
+ * In-app notification via the service-role client. Migration 0036 revoked
+ * `notify_user` from `authenticated` — see `lib/supabase/notifications.ts`.
+ */
 async function notify(
-  supabase: NonNullable<Awaited<ReturnType<typeof createClient>>>,
+  _supabase: NonNullable<Awaited<ReturnType<typeof createClient>>>,
   args: {
     userId: string;
     type: string;
@@ -27,14 +32,7 @@ async function notify(
     link?: string;
   }
 ): Promise<void> {
-  await supabase.rpc('notify_user', {
-    p_user_id: args.userId,
-    p_type: args.type,
-    p_title_key: args.titleKey,
-    p_body_key: args.bodyKey,
-    p_body_args: args.bodyArgs ?? {},
-    p_link: args.link ?? null,
-  });
+  await notifyUser(args);
 }
 
 /**
