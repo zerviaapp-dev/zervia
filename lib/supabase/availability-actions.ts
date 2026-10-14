@@ -5,7 +5,6 @@ import { createClient, isSupabaseConfigured } from './server';
 import { defaultLocale } from '@/lib/locales';
 import type { ActionResult } from './actions';
 
-export type { ActionResult };
 
 const WEEKDAYS = [0, 1, 2, 3, 4, 5, 6];
 
