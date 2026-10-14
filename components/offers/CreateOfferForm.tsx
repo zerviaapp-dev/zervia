@@ -3,9 +3,9 @@
 import { useActionState } from 'react';
 import { useTranslations } from 'next-intl';
 import {
-  createOffer,
-  type ActionResult,
+  createOffer
 } from '@/lib/supabase/offer-actions';
+import type { ActionResult } from '@/lib/supabase/actions';
 import { SubmitButton } from '@/components/auth/SubmitButton';
 
 const initialState: ActionResult = { ok: false, message: '' };
