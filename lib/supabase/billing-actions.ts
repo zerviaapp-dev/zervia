@@ -11,7 +11,6 @@ import {
 } from '@/lib/pricing';
 import type { ActionResult } from './actions';
 
-export type { ActionResult };
 
 export type ProviderBillingRow = {
   id: string;
