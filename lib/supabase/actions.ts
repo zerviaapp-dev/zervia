@@ -1,6 +1,5 @@
 'use server';
 
-import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 import { getTranslations } from 'next-intl/server';
 import { createClient, isSupabaseConfigured } from './server';
@@ -29,17 +28,10 @@ function safeNext(value: FormDataEntryValue | null): string | null {
 }
 
 async function siteOrigin(): Promise<string> {
-  const h = await headers();
-  const origin = h.get('origin');
-  if (origin) return origin;
-  // Fallback for server actions where origin header may be missing.
-  // NEXT_PUBLIC_SITE_URL should be set in production; Vercel provides
-  // VERCEL_PROJECT_PRODUCTION_URL automatically.
-  if (process.env.NEXT_PUBLIC_SITE_URL) return process.env.NEXT_PUBLIC_SITE_URL;
-  if (process.env.VERCEL_PROJECT_PRODUCTION_URL)
-    return `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`;
-  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
-  return 'https://zervia-app-deploy.vercel.app';
+  // SECURITY: Never trust the client-controlled Origin header (open redirect).
+  // Use the shared secure helper with domain allowlist.
+  const { getSiteOrigin } = await import('@/lib/site-origin');
+  return getSiteOrigin();
 }
 
 /** Create a new account: email + password + name + country + language. */
@@ -62,6 +54,13 @@ export async function signUp(
   const referralCode = String(formData.get('referralCode') ?? '')
     .trim()
     .toUpperCase();
+  // Provider intent: "I want to offer services" checkbox on the signup form,
+  // or ?type=provider URL param. Providers are routed to onboarding after
+  // email verification instead of the customer dashboard.
+  const accountType = String(formData.get('accountType') ?? 'customer');
+  const isProvider = accountType === 'provider';
+  const agreedToProviderAgreement =
+    String(formData.get('agreeProviderAgreement') ?? '') === 'yes';
 
   if (!EMAIL_RE.test(email))
     return { ok: false, message: t('errorInvalidEmail') };
@@ -72,6 +71,8 @@ export async function signUp(
   if (fullName.length < 2)
     return { ok: false, message: t('errorNameRequired') };
   if (!country) return { ok: false, message: t('errorCountryRequired') };
+  if (isProvider && !agreedToProviderAgreement)
+    return { ok: false, message: t('errorAgreementRequired') };
 
   // Bot check: Cloudflare Turnstile. Fail closed in production — the
   // verifyTurnstile helper rejects when the secret key is missing there,
@@ -97,6 +98,9 @@ export async function signUp(
         country,
         preferred_locale: language,
         ...(referralCode ? { referral_code: referralCode } : {}),
+        // Provider intent flag — the auth callback reads this to route
+        // new providers to /app/provider/onboarding after verification.
+        ...(isProvider ? { is_provider: true } : {}),
       },
       emailRedirectTo: `${await siteOrigin()}/auth/callback`,
     },
