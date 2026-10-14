@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import Stripe from 'stripe';
-import { getStripe } from '@/lib/stripe';
+import { getStripe, isStripeTestMode } from '@/lib/stripe';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { BOOST_DAYS, FEATURED_WEEK_DAYS, SPOTLIGHT_DAYS } from '@/lib/pricing';
 
@@ -25,6 +25,7 @@ type Meta = {
   zervia_user_id?: string;
   zervia_provider_id?: string;
   zervia_booking_id?: string;
+  zervia_payout_id?: string;
   zervia_tier?: string;
   zervia_interval?: string;
   zervia_kind?: string;
@@ -55,7 +56,7 @@ async function recordTransaction(admin: NonNullable<ReturnType<typeof createAdmi
   stripe_checkout_session_id?: string | null;
   amount_cents: number;
   currency?: string;
-  type: 'subscription' | 'boost' | 'lead_fee' | 'refund' | 'escrow' | 'verification_badge' | 'featured_week' | 'profile_spotlight';
+  type: 'subscription' | 'boost' | 'lead_fee' | 'refund' | 'escrow' | 'verification_badge' | 'featured_week' | 'profile_spotlight' | 'product_order';
   status: 'pending' | 'succeeded' | 'failed' | 'refunded';
   description?: string | null;
 }) {
@@ -143,18 +144,34 @@ export async function POST(req: NextRequest) {
   }
 
   // Idempotency first: claim the event id. A replay inserts nothing and
-  // is acknowledged without reprocessing.
-  const { data: claimed } = await admin
+  // is acknowledged without reprocessing. Distinguish a genuine
+  // duplicate (unique-violation on event_id) from a real insert error:
+  // a real error returns 500 so Stripe retries instead of silently
+  // dropping the event.
+  const { data: claimed, error: claimError } = await admin
     .from('stripe_events')
     .insert({ event_id: event.id, event_type: event.type })
     .select('event_id')
     .single();
+  if (claimError) {
+    // 23505 = unique_violation: this event was already claimed — a
+    // genuine duplicate. Acknowledge without reprocessing.
+    const isDuplicate = (claimError as { code?: string }).code === '23505';
+    if (isDuplicate) {
+      return NextResponse.json({ received: true, deduped: true });
+    }
+    console.error('[stripe/webhook] stripe_events insert failed', event.id, claimError.message);
+    return NextResponse.json({ error: 'event_claim_failed' }, { status: 500 });
+  }
   if (!claimed) {
     return NextResponse.json({ received: true, deduped: true });
   }
 
   try {
-    switch (event.type) {
+    // Cast to string: this SDK version's Event type union omits
+    // 'transfer.failed' (a real Stripe event). All cases cast
+    // event.data.object explicitly, so narrowing is unaffected.
+    switch (event.type as string) {
       case 'checkout.session.completed': {
         const session = event.data.object as Stripe.Checkout.Session;
         const m = metaOf(session);
@@ -192,13 +209,54 @@ export async function POST(req: NextRequest) {
               currency: session.currency ?? 'cad',
               type: 'escrow',
               status: 'succeeded',
-              description: 'Escrow hold — payment secured (TEST MODE)',
+              description: isStripeTestMode()
+                ? 'Escrow hold — payment secured (TEST MODE)'
+                : 'Escrow hold — payment secured',
             });
           }
           break;
         }
 
-        if (!m.zervia_user_id || !m.zervia_provider_id) break;
+        if (!m.zervia_user_id || !m.zervia_provider_id) {
+          // Digital product orders don't have a provider — handle them
+          // separately before dropping the event.
+          if (m.zervia_kind === 'digital_product_order' && m.zervia_user_id) {
+            const productSlug = (m as Record<string, string | undefined>)['zervia_product_slug'];
+            if (productSlug) {
+              const piId =
+                typeof session.payment_intent === 'string' ? session.payment_intent : null;
+              // Idempotent: unique constraint on (user_id, product_slug).
+              const { error: entError } = await admin
+                .from('digital_entitlements')
+                .upsert(
+                  {
+                    user_id: m.zervia_user_id,
+                    product_slug: productSlug,
+                    stripe_checkout_session_id: session.id,
+                    stripe_payment_intent_id: piId,
+                    amount_cents: session.amount_total ?? 0,
+                    currency: session.currency ?? 'cad',
+                  },
+                  { onConflict: 'user_id,product_slug', ignoreDuplicates: true }
+                );
+              if (entError) {
+                console.error('[stripe/webhook] digital entitlement insert failed', entError.message);
+              } else {
+                await recordTransaction(admin, {
+                  user_id: m.zervia_user_id,
+                  stripe_payment_intent_id: piId,
+                  stripe_checkout_session_id: session.id,
+                  amount_cents: session.amount_total ?? 0,
+                  currency: session.currency ?? 'cad',
+                  type: 'product_order',
+                  status: 'succeeded',
+                  description: `Digital product: ${productSlug}`,
+                });
+              }
+            }
+          }
+          break;
+        }
 
         if (m.zervia_kind === 'boost' && m.zervia_listing_id) {
           await activateListingBoost(admin, m.zervia_listing_id);
@@ -265,6 +323,113 @@ export async function POST(req: NextRequest) {
             status: 'succeeded',
             description: 'Profile spotlight (7 days)',
           });
+          break;
+        }
+
+        // Physical product order: mark paid, decrement stock, then fulfill
+        // via CJ Dropshipping (or queue for manual handling when CJ keys
+        // are missing). Idempotent: only transitions from pending_payment.
+        if (m.zervia_kind === 'product_order') {
+          const orderId = (m as Record<string, string | undefined>)['zervia_order_id'];
+          if (orderId) {
+            const piId =
+              typeof session.payment_intent === 'string' ? session.payment_intent : null;
+            const { data: ord } = await admin
+              .from('product_orders')
+              .select(
+                'id, product_id, provider_id, buyer_id, quantity, unit_price_cents, total_cents, currency, status, ship_name, ship_address, ship_city, ship_province, ship_postal, ship_country, ship_phone'
+              )
+              .eq('id', orderId)
+              .maybeSingle();
+            if (ord && (ord as { status: string }).status === 'pending_payment') {
+              const o = ord as {
+                id: string;
+                product_id: string;
+                provider_id: string;
+                buyer_id: string;
+                quantity: number;
+                unit_price_cents: number;
+                total_cents: number;
+                currency: string;
+                ship_name: string | null;
+                ship_address: string | null;
+                ship_city: string | null;
+                ship_province: string | null;
+                ship_postal: string | null;
+                ship_country: string | null;
+                ship_phone: string | null;
+              };
+              const { data: prod } = await admin
+                .from('products')
+                .select('cj_product_id, cj_variant_id, stock')
+                .eq('id', o.product_id)
+                .maybeSingle();
+              const p = prod as {
+                cj_product_id: string | null;
+                cj_variant_id: string | null;
+                stock: number;
+              } | null;
+
+              // Decrement stock when tracked.
+              if (p && p.stock !== -1) {
+                await admin
+                  .from('products')
+                  .update({ stock: Math.max(0, p.stock - o.quantity) })
+                  .eq('id', o.product_id);
+              }
+
+              // Fulfillment: CJ API when configured, else manual queue.
+              let cjOrderId: string | null = null;
+              let queued = false;
+              try {
+                const { isCjConfigured, createCjOrder } = await import(
+                  '@/lib/cj-dropshipping'
+                );
+                if (isCjConfigured() && p?.cj_variant_id) {
+                  const [first = '', ...rest] = (o.ship_name ?? '').split(' ');
+                  cjOrderId = await createCjOrder(
+                    [{ vid: p.cj_variant_id, quantity: o.quantity }],
+                    {
+                      firstName: first,
+                      lastName: rest.join(' '),
+                      address: o.ship_address ?? '',
+                      city: o.ship_city ?? '',
+                      province: o.ship_province ?? '',
+                      zip: o.ship_postal ?? '',
+                      countryCode: (o.ship_country ?? 'CA').slice(0, 2).toUpperCase(),
+                      phone: o.ship_phone ?? '',
+                    },
+                    `Zervia product order ${o.id}`
+                  );
+                }
+              } catch (e) {
+                console.error('[webhook] cj fulfillment failed', e);
+              }
+              if (!cjOrderId) queued = true;
+
+              await admin
+                .from('product_orders')
+                .update({
+                  status: cjOrderId ? 'fulfilling' : 'pending_fulfillment',
+                  stripe_payment_intent_id: piId,
+                  cj_order_id: cjOrderId,
+                  fulfillment_queued: queued,
+                })
+                .eq('id', o.id);
+
+              await recordTransaction(admin, {
+                user_id: o.buyer_id,
+                provider_id: o.provider_id,
+                stripe_payment_intent_id: piId,
+                stripe_checkout_session_id: session.id,
+                amount_cents: session.amount_total ?? o.total_cents,
+                currency: session.currency ?? o.currency?.toLowerCase() ?? 'cad',
+                type: 'product_order',
+                status: 'succeeded',
+                description: `Product order ${o.id} (qty ${o.quantity})`,
+              });
+            }
+          }
           break;
         }
 
@@ -355,6 +520,109 @@ export async function POST(req: NextRequest) {
           .from('subscriptions')
           .update({ status: 'canceled' })
           .eq('stripe_subscription_id', sub.id);
+        break;
+      }
+
+      /**
+       * Stripe Identity document verification. The session's
+       * `zervia_user_id` metadata is the durable user link (set at
+       * session creation in lib/verification.ts). Writes go through the
+       * service-role client — app users never write these columns.
+       *
+       * NOTE: the identity_status / identity_session_id columns arrive
+       * with migration 0031_identity_verification.sql. Until it is
+       * applied the update fails — the error is caught and logged so a
+       * not-yet-migrated deploy never 500s on a valid Stripe event.
+       */
+      case 'identity.verification_session.verified':
+      case 'identity.verification_session.requires_input': {
+        const session = event.data.object as Stripe.Identity.VerificationSession;
+        const userId = (session.metadata as Meta | undefined)?.zervia_user_id;
+        const status = event.type === 'identity.verification_session.verified' ? 'verified' : 'failed';
+        if (userId) {
+          try {
+            const { error } = await admin
+              .from('profiles')
+              .update({ identity_status: status, identity_session_id: session.id })
+              .eq('id', userId);
+            if (error) {
+              console.error(
+                '[stripe/webhook] identity status write failed — apply migration 0031 if the column is missing',
+                error.message
+              );
+            }
+          } catch (err) {
+            console.error('[stripe/webhook] identity status write threw', err);
+          }
+        } else {
+          console.error('[stripe/webhook] identity event without zervia_user_id metadata', event.id);
+        }
+        break;
+      }
+
+      /**
+       * Stripe Connect Express account updates. Syncs the provider's
+       * onboarding status so the payouts dashboard knows when the
+       * provider can receive money.
+       */
+      case 'account.updated': {
+        const account = event.data.object as Stripe.Account;
+        const providerId = (account.metadata as Meta | undefined)?.zervia_provider_id;
+        if (providerId) {
+          const onboardingComplete =
+            (account.details_submitted ?? false) &&
+            (account.payouts_enabled ?? false);
+          await admin
+            .from('providers')
+            .update({
+              stripe_connect_onboarding_complete: onboardingComplete,
+              stripe_connect_charges_enabled: account.charges_enabled ?? false,
+              stripe_connect_payouts_enabled: account.payouts_enabled ?? false,
+              stripe_connect_onboarded_at: onboardingComplete
+                ? new Date().toISOString()
+                : null,
+            })
+            .eq('id', providerId);
+        }
+        break;
+      }
+
+      /**
+       * Stripe Connect transfer failures. A transfer can fail async —
+       * e.g. the recipient's bank rejects it hours after creation. Mark
+       * the payout row failed with Stripe's reason so an admin can retry
+       * it from the payouts view.
+       */
+      case 'transfer.failed':
+      case 'transfer.reversed': {
+        const transfer = event.data.object as Stripe.Transfer;
+        const payoutId = (transfer.metadata as Meta | undefined)?.zervia_payout_id;
+        if (payoutId) {
+          const reason =
+            event.type === 'transfer.reversed'
+              ? 'Transfer reversed by Stripe'
+              : 'Transfer failed at the destination bank';
+          await admin
+            .from('payouts')
+            .update({ status: 'failed', failure_reason: reason.slice(0, 500) })
+            .eq('id', payoutId)
+            .eq('status', 'paid');
+          console.error(
+            '[stripe/webhook]',
+            event.type,
+            'payout',
+            payoutId,
+            'transfer',
+            transfer.id
+          );
+        } else {
+          console.error(
+            '[stripe/webhook]',
+            event.type,
+            'without zervia_payout_id metadata',
+            event.id
+          );
+        }
         break;
       }
 
