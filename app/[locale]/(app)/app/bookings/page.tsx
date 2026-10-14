@@ -93,6 +93,7 @@ export default async function MyBookingsPage({
                 booking={item}
                 statusLabel={t(statusKey[b.status])}
                 scheduledText={scheduledText(b.scheduled_at)}
+                rebookLabel={t('rebookCta')}
               />
             );
           })}
