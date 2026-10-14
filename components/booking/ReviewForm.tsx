@@ -2,9 +2,11 @@
 
 import { useActionState, useState } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
-import { submitReview, type ActionResult } from '@/lib/supabase/booking-actions';
+import { submitReview} from '@/lib/supabase/booking-actions';
+import type { ActionResult } from '@/lib/supabase/actions';
 import { Field } from '@/components/auth/Field';
 import { SubmitButton } from '@/components/auth/SubmitButton';
+import { ReviewPhotoPicker } from './ReviewPhotoPicker';
 
 const initialState: ActionResult = { ok: false, message: '' };
 
@@ -69,6 +71,11 @@ export function ReviewForm({ bookingId }: { bookingId: string }) {
           className="auth-input"
         />
       </Field>
+
+      <div>
+        <p className="mb-2 text-base font-semibold text-brand-900">{t('reviewPhotosLabel')}</p>
+        <ReviewPhotoPicker />
+      </div>
 
       <SubmitButton>{t('reviewSubmit')}</SubmitButton>
     </form>
