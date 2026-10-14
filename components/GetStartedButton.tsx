@@ -13,8 +13,9 @@ export function GetStartedButton() {
       href="/signup"
       className={
         'inline-flex min-h-[56px] items-center justify-center rounded-full px-8 py-4 ' +
-        'bg-brand-600 text-lg font-semibold text-white transition-colors ' +
-        'hover:bg-brand-700 active:bg-brand-800 ' +
+        'bg-brand-600 text-lg font-semibold text-white ' +
+        'transition-all duration-200 hover:scale-[1.03] hover:bg-brand-700 hover:shadow-lg ' +
+        'active:scale-[0.98] active:bg-brand-800 ' +
         'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600'
       }
     >
