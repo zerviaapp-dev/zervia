@@ -6,7 +6,7 @@ import type { MetadataRoute } from 'next';
  * require the admin role. Nothing sensitive is reachable via crawl.
  */
 export default function robots(): MetadataRoute.Robots {
-  const base = 'https://zervia-app-deploy.vercel.app';
+  const base = 'https://zervia.app';
   return {
     rules: {
       userAgent: '*',
