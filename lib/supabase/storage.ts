@@ -4,11 +4,14 @@ import { createClient, isSupabaseConfigured } from './server';
 import { rateLimit } from '@/lib/rate-limit';
 import type { ActionResult } from './actions';
 
-export type { ActionResult };
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 MB per file
 const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const MAX_LISTING_PHOTOS = 5;
+/** Max before/after photos a customer can attach to one review. */
+const MAX_REVIEW_PHOTOS = 3;
+/** Max past-work photos a provider can showcase in their portfolio. */
+const MAX_PORTFOLIO_ITEMS = 12;
 
 /** Validate a single uploaded image; returns the File or an error. */
 function validateImage(
@@ -105,13 +108,30 @@ export async function uploadIdDocument(
       upsert: true, // replacing an old ID is fine and expected
     });
 
-  if (error) return { ok: false, message: 'errorUploadFailed' };
+  if (error) {
+    // Log the actual error for diagnosis (bucket missing, RLS, etc.)
+    console.error('[storage] ID upload failed:', error.message, '| bucket: verification-docs | path:', path);
+    // Return specific error codes for common issues
+    if (error.message.includes('Bucket not found') || error.message.includes('bucket')) {
+      return { ok: false, message: 'errorBucketMissing' };
+    }
+    if (error.message.includes('policy') || error.message.includes('RLS') || error.message.includes('permission')) {
+      return { ok: false, message: 'errorPermissionDenied' };
+    }
+    return { ok: false, message: 'errorUploadFailed' };
+  }
 
   // Record the path on the provider row so the admin queue shows "ID ✓".
-  await supabase
+  // Fire-and-forget: don't block the upload response if this is slow.
+  // During onboarding the provider row may not exist yet — that's fine,
+  // the path is also stored client-side and saved on submit.
+  supabase
     .from('providers')
     .update({ id_document_path: path })
-    .eq('user_id', user.id);
+    .eq('user_id', user.id)
+    .then(({ error: updateError }) => {
+      if (updateError) console.error('[storage] id_document_path update failed:', updateError.message);
+    });
 
   return { ok: true, path };
 }
@@ -141,7 +161,73 @@ export async function deleteListingPhoto(
   return { ok: !error };
 }
 
-export { MAX_LISTING_PHOTOS };
+export { MAX_LISTING_PHOTOS, MAX_REVIEW_PHOTOS, MAX_PORTFOLIO_ITEMS };
+
+/**
+ * Shared photo upload into the public `listing-photos` bucket.
+ * Stored as "<user_id>/<uuid>.<ext>" — matches the RLS folder policy, so
+ * any signed-in user (customer or provider) can store their own images here.
+ * Used by review photos and portfolio items; listing photos keep their own
+ * named wrapper for clarity.
+ */
+async function putPublicPhoto(
+  field: string,
+  formData: FormData,
+  rateKey: string,
+  rateMax: number
+): Promise<{ ok: true; url: string } | { ok: false; message: string }> {
+  if (!isSupabaseConfigured()) return { ok: false, message: 'errorNotConfigured' };
+
+  if (!(await rateLimit(rateKey, rateMax, 60 * 60 * 1000))) {
+    return { ok: false, message: 'errorRateLimited' };
+  }
+
+  const supabase = (await createClient())!;
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { ok: false, message: 'errorSignInRequired' };
+
+  const checked = validateImage(formData.get(field));
+  if (!checked.ok) return checked;
+
+  const path = `${user.id}/${crypto.randomUUID()}.${extOf(checked.file)}`;
+  const { error } = await supabase.storage
+    .from('listing-photos')
+    .upload(path, checked.file, {
+      contentType: checked.file.type,
+      upsert: false,
+    });
+
+  if (error) return { ok: false, message: 'errorUploadFailed' };
+
+  const {
+    data: { publicUrl },
+  } = supabase.storage.from('listing-photos').getPublicUrl(path);
+  return { ok: true, url: publicUrl };
+}
+
+/**
+ * Upload one customer photo for a review or portfolio item.
+ * Same bucket and RLS rules as listing photos; the caller's user folder
+ * keeps customers' and providers' images separated.
+ */
+export async function uploadCustomerPhoto(
+  formData: FormData
+): Promise<{ ok: true; url: string } | { ok: false; message: string }> {
+  // Abuse guard: 20 photo uploads per IP per hour.
+  return putPublicPhoto('photo', formData, 'photo_upload', 20);
+}
+
+/**
+ * Delete one of the caller's own customer photos (review or portfolio)
+ * by public URL. Same bucket/folder rules as listing photos.
+ */
+export async function deleteCustomerPhoto(
+  photoUrl: string
+): Promise<{ ok: boolean }> {
+  return deleteListingPhoto(photoUrl);
+}
 
 /**
  * Upload a verification document (any of the 4 doc types) to the PRIVATE
