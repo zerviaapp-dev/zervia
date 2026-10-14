@@ -2,6 +2,7 @@ import { getTranslations } from 'next-intl/server';
 import { redirect } from 'next/navigation';
 import { Panel } from '@/components/Panel';
 import { NotConfigured } from '@/components/auth/NotConfigured';
+import { DataLoadError } from '@/components/admin/DataLoadError';
 import { createClient } from '@/lib/supabase/server';
 import { localizedPath } from '@/lib/locale-path';
 import { dismissReport, actionReport } from '@/lib/supabase/moderation-actions';
@@ -54,16 +55,34 @@ export default async function AdminModerationPage({
     redirect(localizedPath('/app/dashboard', locale));
   }
 
-  const { data } = (await supabase
-    .from('reports')
-    .select(
-      'id, reason, details, status, created_at, listing_id, provider_id, listings(title), providers(business_name), reporter:profiles!reports_reporter_id_fkey(display_name)'
-    )
-    .eq('status', 'open')
-    .order('created_at', { ascending: true })) as {
-    data: Report[] | null;
-  };
-  const queue = data ?? [];
+  let queue: Report[] = [];
+  let loadError = false;
+  try {
+    const { data, error } = (await supabase
+      .from('reports')
+      .select(
+        'id, reason, details, status, created_at, listing_id, provider_id, listings(title), providers(business_name), reporter:profiles!reports_reporter_id_fkey(display_name)'
+      )
+      .eq('status', 'open')
+      .order('created_at', { ascending: true })) as {
+      data: Report[] | null;
+      error: unknown;
+    };
+    if (error) throw error;
+    queue = data ?? [];
+  } catch (e) {
+    console.error('[admin/moderation] failed to load report queue:', e);
+    loadError = true;
+  }
+
+  if (loadError) {
+    return (
+      <div className="space-y-5">
+        <h1 className="text-3xl font-bold text-brand-900">{t('moderationTitle')}</h1>
+        <DataLoadError />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-5">
