@@ -4,8 +4,8 @@ import { getTranslations } from 'next-intl/server';
 import { createClient } from './server';
 import { BOOST_COST_POINTS } from '@/lib/rewards';
 import type { ActionResult } from './actions';
+import { awardPointsAdmin } from './notifications';
 
-export type { ActionResult };
 
 export type LedgerRow = {
   id: string;
@@ -23,6 +23,37 @@ export type ReferralRow = {
   redeemed_at: string | null;
   created_at: string;
 };
+
+/** Leaderboard time windows (matches migration 0028's referral_leaderboard fn). */
+export type LeaderboardPeriod = 'week' | 'month' | 'all';
+
+export type LeaderboardRow = {
+  rank: number;
+  display_name: string;
+  referral_count: number;
+  redeemed_count: number;
+};
+
+/**
+ * Top referrers for a period, via the SECURITY DEFINER referral_leaderboard()
+ * function (migration 0028). Returns [] if the function isn't deployed yet —
+ * the page renders its empty state instead of crashing.
+ */
+export async function getReferralLeaderboard(
+  period: LeaderboardPeriod
+): Promise<LeaderboardRow[]> {
+  const ctx = await authed();
+  if (!ctx) return [];
+  try {
+    const { data, error } = await ctx.supabase.rpc('referral_leaderboard', {
+      p_period: period,
+    });
+    if (error || !data) return [];
+    return (data as LeaderboardRow[]).slice(0, 10);
+  } catch {
+    return [];
+  }
+}
 
 async function rewardsT(locale: string) {
   return getTranslations({ locale, namespace: 'Rewards' });
@@ -122,11 +153,13 @@ export async function awardSignupBonus(
   const ctx = await authed();
   if (!ctx) return { ok: false, message: ta('errorSessionExpired') };
 
-  const { error } = await ctx.supabase.rpc('award_points', {
-    p_user_id: ctx.userId,
-    p_delta: 100,
-    p_reason: 'signup',
-    p_reference_id: null,
+  // Migration 0036 revoked `award_points` from `authenticated` — route
+  // through the service-role client (see `lib/supabase/notifications.ts`).
+  const { error } = await awardPointsAdmin({
+    userId: ctx.userId,
+    delta: 100,
+    reason: 'signup',
+    referenceId: null,
   });
   if (error) {
     if (error.message.toLowerCase().includes('already awarded'))
@@ -176,11 +209,13 @@ export async function redeemPointsForBoost(
   if (completedJobs < 10)
     return { ok: false, message: t('redeemBoostNotEligible') };
 
-  const { error } = await ctx.supabase.rpc('award_points', {
-    p_user_id: ctx.userId,
-    p_delta: -BOOST_COST_POINTS,
-    p_reason: 'redemption',
-    p_reference_id: listingId,
+  // Migration 0036 revoked `award_points` from `authenticated` — route
+  // through the service-role client (see `lib/supabase/notifications.ts`).
+  const { error } = await awardPointsAdmin({
+    userId: ctx.userId,
+    delta: -BOOST_COST_POINTS,
+    reason: 'redemption',
+    referenceId: listingId,
   });
   if (error) {
     if (error.message.toLowerCase().includes('insufficient points'))
