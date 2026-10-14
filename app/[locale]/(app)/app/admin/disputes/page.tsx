@@ -2,6 +2,7 @@ import { getTranslations } from 'next-intl/server';
 import { redirect } from 'next/navigation';
 import { Panel } from '@/components/Panel';
 import { NotConfigured } from '@/components/auth/NotConfigured';
+import { DataLoadError } from '@/components/admin/DataLoadError';
 import { createClient } from '@/lib/supabase/server';
 import { localizedPath } from '@/lib/locale-path';
 import { resolveDispute } from '@/lib/supabase/moderation-actions';
@@ -52,16 +53,34 @@ export default async function AdminDisputesPage({
     redirect(localizedPath('/app/dashboard', locale));
   }
 
-  const { data } = (await supabase
-    .from('bookings')
-    .select(
-      'id, scheduled_at, dispute_reason, created_at, listings(title), providers(business_name), customer:profiles!bookings_customer_id_fkey(display_name), reporter:profiles!bookings_disputed_by_fkey(display_name)'
-    )
-    .eq('status', 'disputed')
-    .order('created_at', { ascending: true })) as {
-    data: DisputedBooking[] | null;
-  };
-  const queue = data ?? [];
+  let queue: DisputedBooking[] = [];
+  let loadError = false;
+  try {
+    const { data, error } = (await supabase
+      .from('bookings')
+      .select(
+        'id, scheduled_at, dispute_reason, created_at, listings(title), providers(business_name), customer:profiles!bookings_customer_id_fkey(display_name), reporter:profiles!bookings_disputed_by_fkey(display_name)'
+      )
+      .eq('status', 'disputed')
+      .order('created_at', { ascending: true })) as {
+      data: DisputedBooking[] | null;
+      error: unknown;
+    };
+    if (error) throw error;
+    queue = data ?? [];
+  } catch (e) {
+    console.error('[admin/disputes] failed to load dispute queue:', e);
+    loadError = true;
+  }
+
+  if (loadError) {
+    return (
+      <div className="space-y-5">
+        <h1 className="text-3xl font-bold text-brand-900">{t('disputesTitle')}</h1>
+        <DataLoadError />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-5">
