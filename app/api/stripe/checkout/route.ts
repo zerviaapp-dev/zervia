@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { headers } from 'next/headers';
 import { createClient } from '@/lib/supabase/server';
 import { getStripe, isStripeConfigured, priceIdFor, boostPriceId, verificationBadgePriceId, featuredWeekPriceId, profileSpotlightPriceId } from '@/lib/stripe';
 import { currencyForCountry } from '@/lib/currency';
 import { localizedPath } from '@/lib/locale-path';
 import { takeAsync } from '@/lib/rate-limit';
+import { getSiteOrigin } from '@/lib/site-origin';
 
 export const runtime = 'nodejs';
 
@@ -76,8 +76,7 @@ export async function POST(req: NextRequest) {
   }
 
   const locale = body.locale ?? 'en';
-  const h = await headers();
-  const origin = h.get('origin') ?? '';
+  const origin = getSiteOrigin(); // SECURE: never trust client Origin header
   const successUrl = `${origin}${localizedPath('/app/billing', locale)}?checkout=success`;
   const cancelUrl = `${origin}${localizedPath('/app/billing', locale)}?checkout=cancelled`;
 
