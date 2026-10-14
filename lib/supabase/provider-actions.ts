@@ -7,9 +7,8 @@ import { createClient, isSupabaseConfigured } from './server';
 import { defaultLocale, locales } from '@/lib/locales';
 import { localizedPath } from '@/lib/locale-path';
 import { isCategory, isSubcategory, isPriceType, isListingStatus } from '@/lib/categories';
+import { PROVIDER_AGREEMENT_VERSION } from '@/lib/provider-agreement';
 import type { ActionResult } from './actions';
-
-export type { ActionResult };
 
 async function providerT(locale: string) {
   return getTranslations({ locale, namespace: 'Provider' });
@@ -48,10 +47,10 @@ type ValidatedProvider = {
   languages: string[];
 };
 
-function validateProvider(
+async function validateProvider(
   formData: FormData,
   t: Awaited<ReturnType<typeof providerT>>
-): { ok: true; value: ValidatedProvider } | { ok: false; message: string } {
+): Promise<{ ok: true; value: ValidatedProvider } | { ok: false; message: string }> {
   const businessName = str(formData, 'businessName');
   const category = str(formData, 'category');
   const description = str(formData, 'businessDescription');
@@ -97,7 +96,72 @@ type ValidatedListing = {
   city: string;
   status: string;
   photos: string[];
+  /** Optional map pin (migration 0032_listing_coordinates). */
+  latitude: number | null;
+  longitude: number | null;
 };
+
+/**
+ * Parses an optional coordinate from form data. Returns null for missing,
+ * empty, or out-of-range values — coordinates are always optional, so an
+ * invalid pin is dropped rather than failing the whole submission.
+ */
+function parseCoord(raw: string, min: number, max: number): number | null {
+  if (raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min || n > max) return null;
+  return n;
+}
+
+type SupabaseSessionClient = NonNullable<Awaited<ReturnType<typeof createClient>>>;
+
+/**
+ * PostgREST "undefined column" code. Listing writes include latitude/longitude
+ * once migration 0032_listing_coordinates is applied; until then the column
+ * is unknown and the write must be retried without coordinates so listing
+ * creation/updates never break.
+ */
+const UNDEFINED_COLUMN = '42703';
+
+function isMissingColumnError(error: { code?: string } | null): boolean {
+  return !!error && error.code === UNDEFINED_COLUMN;
+}
+
+/** Insert a listing row, retrying without coordinates if the columns are missing. */
+async function insertListingRow(
+  supabase: SupabaseSessionClient,
+  row: Record<string, unknown>
+): Promise<{ error: { code?: string; message: string } | null }> {
+  const first = await supabase.from('listings').insert(row);
+  if (isMissingColumnError(first.error)) {
+    const { latitude: _lat, longitude: _lng, ...rest } = row;
+    return supabase.from('listings').insert(rest);
+  }
+  return first;
+}
+
+/** Update a listing row, retrying without coordinates if the columns are missing. */
+async function updateListingRow(
+  supabase: SupabaseSessionClient,
+  row: Record<string, unknown>,
+  listingId: string,
+  providerId: string
+): Promise<{ error: { code?: string; message: string } | null }> {
+  const first = await supabase
+    .from('listings')
+    .update(row)
+    .eq('id', listingId)
+    .eq('provider_id', providerId);
+  if (isMissingColumnError(first.error)) {
+    const { latitude: _lat, longitude: _lng, ...rest } = row;
+    return supabase
+      .from('listings')
+      .update(rest)
+      .eq('id', listingId)
+      .eq('provider_id', providerId);
+  }
+  return first;
+}
 
 /**
  * Validate the photos JSON from the PhotoUploader hidden input.
@@ -123,10 +187,10 @@ function validatePhotos(raw: string): string[] | null {
   return urls;
 }
 
-function validateListing(
+async function validateListing(
   formData: FormData,
   t: Awaited<ReturnType<typeof providerT>>
-): { ok: true; value: ValidatedListing } | { ok: false; message: string } {
+): Promise<{ ok: true; value: ValidatedListing } | { ok: false; message: string }> {
   const title = str(formData, 'title');
   const description = str(formData, 'description');
   const category = str(formData, 'category');
@@ -136,6 +200,9 @@ function validateListing(
   const country = str(formData, 'country');
   const city = str(formData, 'city');
   const status = str(formData, 'status') || 'draft';
+  // Optional map pin from the LocationPicker (hidden latitude/longitude inputs).
+  const latitude = parseCoord(str(formData, 'latitude'), -90, 90);
+  const longitude = parseCoord(str(formData, 'longitude'), -180, 180);
 
   if (title.length < 3 || title.length > 120)
     return { ok: false, message: t('errorTitle') };
@@ -178,6 +245,8 @@ function validateListing(
       city,
       status,
       photos,
+      latitude,
+      longitude,
     },
   };
 }
@@ -211,12 +280,27 @@ export async function submitOnboarding(
   _prev: ActionResult,
   formData: FormData
 ): Promise<ActionResult> {
+  // Wrap everything in try/catch — an unhandled throw in a server action
+  // used with useActionState causes "Application error: client-side exception".
+  // Always return a result object, never throw.
+  try {
+    return await submitOnboardingInner(_prev, formData);
+  } catch (e) {
+    console.error('[onboarding] Unhandled submit error:', e);
+    return { ok: false, message: 'Something went wrong. Please try again.' };
+  }
+}
+
+async function submitOnboardingInner(
+  _prev: ActionResult,
+  formData: FormData
+): Promise<ActionResult> {
   const locale = localeOf(formData);
   const t = await providerT(locale);
 
-  const validated = validateProvider(formData, t);
+  const validated = await validateProvider(formData, t);
   if (!validated.ok) return { ok: false, message: validated.message };
-  const listingValidated = validateListing(formData, t);
+  const listingValidated = await validateListing(formData, t);
   if (!listingValidated.ok)
     return { ok: false, message: listingValidated.message };
 
@@ -230,22 +314,70 @@ export async function submitOnboarding(
   const p = validated.value;
   const l = listingValidated.value;
 
-  const { data: provider, error: providerError } = await supabase
-    .from('providers')
-    .insert({
-      user_id: userId,
-      business_name: p.businessName,
-      category: p.category,
-      description: p.description || null,
-      country: p.country,
-      city: p.city || null,
-      phone: p.phone || null,
-      whatsapp: p.whatsapp || null,
-      languages: p.languages,
-      status: 'pending',
-    })
-    .select('id')
-    .single();
+  // Provider Agreement must be accepted (checkbox on the review step).
+  // The client disables submit until checked; the server enforces it.
+  if (str(formData, 'agreementAccepted') !== 'true') {
+    return { ok: false, message: t('errorAgreementRequired') };
+  }
+
+  // Initials act as the provider's signature on the agreement (Liz).
+  // Required alongside the checkbox; 2-10 characters.
+  const agreementInitials = str(formData, 'agreementInitials').trim();
+  if (agreementInitials.length < 2 || agreementInitials.length > 10) {
+    return { ok: false, message: t('errorAgreementInitials') };
+  }
+
+  // Government ID verification is mandatory. The IdUploader writes
+  // to the private `verification-docs` bucket under `<userId>/id.<ext>`,
+  // so the server re-checks storage rather than trusting the client.
+  const { data: idFiles, error: idListError } = await supabase.storage
+    .from('verification-docs')
+    .list(userId);
+  if (idListError || !idFiles || idFiles.length === 0) {
+    return { ok: false, message: t('errorIdRequired') };
+  }
+  // Save the path so the admin queue can show "ID ✓" and view the document.
+  // The path is required — never null for a valid onboarding.
+  const idDocumentPath: string = `${userId}/${idFiles[0].name}`;
+
+  const baseRow = {
+    user_id: userId,
+    business_name: p.businessName,
+    category: p.category,
+    description: p.description || null,
+    country: p.country,
+    city: p.city || null,
+    phone: p.phone || null,
+    whatsapp: p.whatsapp || null,
+    languages: p.languages,
+    status: 'pending',
+    id_document_path: idDocumentPath,
+  };
+  // Agreement acceptance (columns from migration 0035). If the migration
+  // isn't applied yet the insert fails on the unknown column — retry
+  // without the agreement columns so onboarding still works.
+  // NOTE: `agreement_initials` has no migration yet — it rides the same
+  // fallback. A migration adding `providers.agreement_initials text`
+  // will make the initials persist.
+  let provider: { id: string } | null = null;
+  let providerError: unknown = null;
+  {
+    const withAgreement = {
+      ...baseRow,
+      agreement_version: PROVIDER_AGREEMENT_VERSION,
+      agreement_accepted_at: new Date().toISOString(),
+      agreement_initials: agreementInitials,
+    };
+    const r1 = await supabase.from('providers').insert(withAgreement).select('id').single();
+    if (r1.error && /agreement_version|agreement_accepted_at|agreement_initials/.test(r1.error.message)) {
+      const r2 = await supabase.from('providers').insert(baseRow).select('id').single();
+      provider = r2.data;
+      providerError = r2.error;
+    } else {
+      provider = r1.data;
+      providerError = r1.error;
+    }
+  }
 
   if (providerError || !provider)
     return { ok: false, message: t('errorGeneric') };
@@ -265,7 +397,9 @@ export async function submitOnboarding(
 
   if (listingError) return { ok: false, message: t('errorGeneric') };
 
-  redirect(localizedPath('/app/provider', locale));
+  // Return success — the client handles the redirect (avoids NEXT_REDIRECT
+  // issues with useActionState that caused client-side crashes).
+  return { ok: true, message: '' };
 }
 
 /** Create a listing under the caller's own provider row. */
@@ -276,7 +410,7 @@ export async function createListing(
   const locale = localeOf(formData);
   const t = await providerT(locale);
 
-  const validated = validateListing(formData, t);
+  const validated = await validateListing(formData, t);
   if (!validated.ok) return { ok: false, message: validated.message };
 
   const session = await requireUser(t);
@@ -287,7 +421,7 @@ export async function createListing(
   if (!providerId) return { ok: false, message: t('errorNotProvider') };
 
   const l = validated.value;
-  const { error } = await supabase.from('listings').insert({
+  const { error } = await insertListingRow(supabase, {
     provider_id: providerId,
     title: l.title,
     description: l.description || null,
@@ -299,6 +433,8 @@ export async function createListing(
     city: l.city || null,
     status: l.status,
     photos: l.photos,
+    latitude: l.latitude,
+    longitude: l.longitude,
   });
 
   if (error) return { ok: false, message: t('errorGeneric') };
@@ -314,7 +450,7 @@ export async function updateListing(
   const locale = localeOf(formData);
   const t = await providerT(locale);
 
-  const validated = validateListing(formData, t);
+  const validated = await validateListing(formData, t);
   if (!validated.ok) return { ok: false, message: validated.message };
 
   const listingId = str(formData, 'id');
@@ -330,9 +466,9 @@ export async function updateListing(
   const l = validated.value;
   // RLS ("Owners update own listings") rejects anything not owned —
   // the eq(provider_id) is belt-and-suspenders.
-  const { error } = await supabase
-    .from('listings')
-    .update({
+  const { error } = await updateListingRow(
+    supabase,
+    {
       title: l.title,
       description: l.description || null,
       category: l.category,
@@ -343,9 +479,12 @@ export async function updateListing(
       city: l.city || null,
       status: l.status,
       photos: l.photos,
-    })
-    .eq('id', listingId)
-    .eq('provider_id', providerId);
+      latitude: l.latitude,
+      longitude: l.longitude,
+    },
+    listingId,
+    providerId
+  );
 
   if (error) return { ok: false, message: t('errorGeneric') };
 
