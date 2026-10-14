@@ -1,8 +1,10 @@
 'use client';
 
-import { useActionState } from 'react';
+import { useActionState, useEffect, useRef } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
-import { disputeBooking, type ActionResult } from '@/lib/supabase/booking-actions';
+import { toast } from 'sonner';
+import { disputeBooking} from '@/lib/supabase/booking-actions';
+import type { ActionResult } from '@/lib/supabase/actions';
 import { Field } from '@/components/auth/Field';
 import { SubmitButton } from '@/components/auth/SubmitButton';
 
@@ -17,6 +19,16 @@ export function DisputeForm({ bookingId }: { bookingId: string }) {
   const t = useTranslations('Bookings');
   const locale = useLocale();
   const [state, formAction] = useActionState(disputeBooking, initialState);
+
+  // Toast feedback supplements the inline error card (kept for accessibility).
+  const lastToasted = useRef('');
+  useEffect(() => {
+    if (state.message && state.message !== lastToasted.current) {
+      lastToasted.current = state.message;
+      if (state.ok) toast.success(state.message);
+      else toast.error(state.message);
+    }
+  }, [state]);
 
   return (
     <form action={formAction} className="space-y-5">
