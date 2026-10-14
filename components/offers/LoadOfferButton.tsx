@@ -3,9 +3,9 @@
 import { useActionState } from 'react';
 import { useTranslations } from 'next-intl';
 import {
-  activateOffer,
-  type ActionResult,
+  activateOffer
 } from '@/lib/supabase/offer-actions';
+import type { ActionResult } from '@/lib/supabase/actions';
 
 const initialState: ActionResult = { ok: false, message: '' };
 
