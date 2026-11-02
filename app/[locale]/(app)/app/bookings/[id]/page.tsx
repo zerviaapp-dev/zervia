@@ -1,0 +1,602 @@
+import { getTranslations } from 'next-intl/server';
+import { notFound, redirect } from 'next/navigation';
+import { Link } from '@/i18n/routing';
+import { Panel } from '@/components/Panel';
+import { NotConfigured } from '@/components/auth/NotConfigured';
+import { StatusChip } from '@/components/booking/BookingCard';
+import { BookingActions } from '@/components/booking/BookingActions';
+import { RequestReviewButton } from '@/components/booking/RequestReviewButton';
+import { BookingChat, type ChatMessage } from '@/components/booking/BookingChat';
+import { QuoteCard, type QuoteRow } from '@/components/booking/QuoteCard';
+import { QuoteForm } from '@/components/booking/QuoteForm';
+import { PaymentPanel } from '@/components/booking/PaymentPanel';
+import { DisputeResolutionPanel } from '@/components/booking/DisputeResolutionPanel';
+import { ReworkForm } from '@/components/booking/ReworkForm';
+import { PostServiceSurvey } from '@/components/booking/PostServiceSurvey';
+import { SectionErrorBoundary } from '@/components/booking/SectionErrorBoundary';
+import { createClient } from '@/lib/supabase/server';
+import { isStripeTestMode } from '@/lib/stripe';
+import { localizedPath } from '@/lib/locale-path';
+import { isServiceBookingLive } from '@/lib/booking-flag';
+import { asCurrency, currencyForCountry, formatCurrency } from '@/lib/currency';
+import {
+  platformFeeBps,
+  platformFeeCents,
+  providerNetCents,
+  isMemberSubscription,
+  isAuditBadgeValid,
+} from '@/lib/pricing';
+
+type DetailBooking = {
+  id: string;
+  listing_id: string;
+  customer_id: string;
+  provider_id: string;
+  scheduled_at: string | null;
+  status: 'pending' | 'confirmed' | 'in_progress' | 'completed' | 'cancelled' | 'disputed';
+  notes: string | null;
+  dispute_reason?: string | null;
+  review_requested_at?: string | null;
+  agreed_price_cents?: number | null;
+  completed_at?: string | null;
+  rework_requested_at?: string | null;
+  created_at: string;
+  listings: { id: string; title: string; price_cents: number | null; price_type: string } | null;
+  providers: { business_name: string; user_id: string; country: string | null; audited_until?: string | null } | null;
+  customer: { display_name: string } | null;
+};
+
+type EscrowInfo = {
+  status: 'held' | 'released' | 'refunded' | 'disputed';
+  amount_cents: number;
+  currency: string | null;
+} | null;
+
+type ReviewRow = {
+  id: string;
+  rating: number;
+  text: string | null;
+  created_at: string;
+};
+
+/**
+ * Booking detail: status timeline, parties, notes, and role-appropriate
+ * actions. One page serves customer, provider, and admin views — the
+ * actions shown depend on who is looking and the booking status.
+ * RLS is the backstop: if you are not a party (or admin) you see nothing.
+ */
+export default async function BookingDetailPage({
+  params,
+}: {
+  params: Promise<{ locale: string; id: string }>;
+}) {
+  const { locale: paramLocale, id } = await params;
+  // Defensive: if locale is missing from params (should not happen with
+  // [locale] segment, but guards against a client-side crash), fall back
+  // to the default locale instead of passing undefined to client components.
+  const locale = paramLocale ?? 'en';
+  const t = await getTranslations({ locale, namespace: 'Bookings' });
+  // Connector model: booking actions / payment / dispute / quote surfaces
+  // render only in the dormant first-party booking model.
+  const bookingLive = isServiceBookingLive();
+  const supabase = await createClient();
+
+  if (!supabase) {
+    return <NotConfigured />;
+  }
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    redirect(localizedPath('/login', locale));
+  }
+
+  const SELECT_FULL =
+    'id, listing_id, customer_id, provider_id, scheduled_at, status, notes, dispute_reason, review_requested_at, agreed_price_cents, completed_at, rework_requested_at, created_at, listings(id, title, price_cents, price_type), providers(business_name, user_id, country, audited_until), customer:profiles!bookings_customer_id_fkey(display_name)';
+  const SELECT_MINIMAL =
+    'id, listing_id, customer_id, provider_id, scheduled_at, status, notes, created_at, listings(id, title, price_cents, price_type), providers(business_name, user_id, country), customer:profiles!bookings_customer_id_fkey(display_name)';
+
+  let bookingResult = (await supabase
+    .from('bookings')
+    .select(SELECT_FULL)
+    .eq('id', id)
+    .maybeSingle()) as { data: DetailBooking | null; error: { code?: string } | null };
+
+  // Fallback to minimal columns if optional columns are missing
+  // (PGRST204 schema cache miss or 42703 undefined column).
+  if (bookingResult.error && ['42703', 'PGRST204'].includes(bookingResult.error.code || '')) {
+    bookingResult = (await supabase
+      .from('bookings')
+      .select(SELECT_MINIMAL)
+      .eq('id', id)
+      .maybeSingle()) as { data: DetailBooking | null; error: { code?: string } | null };
+  }
+
+  const { data: booking } = bookingResult;
+
+  // Not found OR not yours: same response, never a hint it exists.
+  if (!booking) {
+    notFound();
+  }
+
+  const { data: providerRow } = await supabase
+    .from('providers')
+    .select('id')
+    .eq('user_id', user.id)
+    .maybeSingle();
+
+  const isCustomer = booking.customer_id === user.id;
+  const isProvider =
+    providerRow?.id === booking.provider_id &&
+    booking.providers?.user_id === user.id;
+  const { data: isAdmin } = await supabase.rpc('is_admin');
+
+  if (!isCustomer && !isProvider && isAdmin !== true) {
+    notFound();
+  }
+  const role: 'customer' | 'provider' = isProvider ? 'provider' : 'customer';
+
+  const { data: review } = (await supabase
+    .from('reviews')
+    .select('id, rating, text, created_at')
+    .eq('booking_id', booking.id)
+    .maybeSingle()) as { data: ReviewRow | null };
+
+  // Required post-service survey (CEO decision): one per booking.
+  const { data: survey } = (await supabase
+    .from('post_service_surveys')
+    .select('id')
+    .eq('booking_id', booking.id)
+    .maybeSingle()) as { data: { id: string } | null };
+
+  // Chat thread + quotes (RLS admits only the parties).
+  const { data: messages } = (await supabase
+    .from('messages')
+    .select('id, body, sender_id, seen_at, created_at')
+    .eq('booking_id', booking.id)
+    .order('created_at', { ascending: true })) as {
+    data: ChatMessage[] | null;
+  };
+  const { data: quotes } = (await supabase
+    .from('quotes')
+    .select('id, price_cents, scope, proposed_at, status, created_at')
+    .eq('booking_id', booking.id)
+    .order('created_at', { ascending: false })) as {
+    data: QuoteRow[] | null;
+  };
+
+  const counterpartyName =
+    role === 'customer'
+      ? (booking.providers?.business_name ?? '')
+      : (booking.customer?.display_name ?? '');
+
+  const statusKey = {
+    pending: 'statusPending',
+    confirmed: 'statusConfirmed',
+    in_progress: 'statusInProgress',
+    completed: 'statusCompleted',
+    cancelled: 'statusCancelled',
+    disputed: 'statusDisputed',
+  } as const;
+
+  const timeline: { key: string; at: string | null; done: boolean }[] = [
+    { key: 'timelineRequested', at: booking.created_at, done: true },
+    {
+      key: 'timelineConfirmed',
+      at: null,
+      done: ['confirmed', 'in_progress', 'completed'].includes(booking.status),
+    },
+    {
+      key: 'timelineInProgress',
+      at: null,
+      done: ['in_progress', 'completed'].includes(booking.status),
+    },
+    { key: 'timelineCompleted', at: null, done: booking.status === 'completed' },
+  ];
+
+  const canDispute =
+    (isCustomer || isProvider) &&
+    ['pending', 'confirmed', 'in_progress'].includes(booking.status);
+  const canReview =
+    isCustomer && booking.status === 'completed' && !review;
+  // Required survey: customer, completed booking, no survey submitted yet.
+  const canSurvey =
+    isCustomer && booking.status === 'completed' && !survey;
+
+  // Escrow payment state (RLS admits the parties; admins see it too).
+  const { data: escrow } = (await supabase
+    .from('escrow_payments')
+    .select('status, amount_cents, currency')
+    .eq('booking_id', booking.id)
+    .maybeSingle()) as { data: EscrowInfo };
+
+  // Server-truth payable amount: accepted-quote price, else fixed listing price.
+  const payableAmount =
+    booking.agreed_price_cents ??
+    (booking.listings?.price_type === 'fixed'
+      ? booking.listings?.price_cents
+      : null) ??
+    null;
+  const canPay =
+    isCustomer &&
+    ['pending', 'confirmed'].includes(booking.status) &&
+    !escrow &&
+    payableAmount != null &&
+    payableAmount > 0;
+
+  // The agreed price is denominated in the provider's currency (the
+  // provider set it in their market). The escrow row carries the Stripe
+  // charge currency once a payment exists.
+  const priceCurrency = currencyForCountry(booking.providers?.country ?? null);
+  const escrowCurrency = asCurrency(escrow?.currency ?? null);
+
+  // Platform fee transparency: providers see the fee breakdown BEFORE
+  // accepting/completing. Free providers pay 10%, members pay 5%.
+  // A valid 🏅 Audited badge lowers it to 8% / 4% (see lib/pricing.ts).
+  let providerIsMember = false;
+  let providerIsAudited = false;
+  let feeBps = 0;
+  let feeCents = 0;
+  let netCents = 0;
+  if (role === 'provider' && payableAmount != null && payableAmount > 0) {
+    const { data: sub } = await supabase
+      .from('subscriptions')
+      .select('tier, status')
+      .eq('provider_id', booking.provider_id)
+      .maybeSingle();
+    providerIsMember = isMemberSubscription(sub);
+    providerIsAudited = isAuditBadgeValid(booking.providers?.audited_until ?? null);
+    feeBps = platformFeeBps(providerIsMember, providerIsAudited);
+    feeCents = platformFeeCents(payableAmount, providerIsMember, providerIsAudited);
+    netCents = providerNetCents(payableAmount, providerIsMember, providerIsAudited);
+  }
+
+  // 48-hour rework window after completion.
+  const completedAtMs = booking.completed_at
+    ? new Date(booking.completed_at).getTime()
+    : null;  const showRework =
+    isCustomer &&
+    booking.status === 'completed' &&
+    !booking.rework_requested_at &&
+    completedAtMs !== null &&
+    Date.now() - completedAtMs <= 48 * 60 * 60 * 1000;
+
+  return (
+    <SectionErrorBoundary>
+    <div className="space-y-5">
+      <Link
+        href={role === 'provider' ? '/app/provider/bookings' : '/app/bookings'}
+        className="inline-flex min-h-[44px] items-center text-base font-semibold text-brand-700"
+      >
+        ← {role === 'provider' ? t('bookingRequests') : t('myBookings')}
+      </Link>
+
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <h1 className="text-3xl font-bold text-brand-900">{t('detailTitle')}</h1>
+        <StatusChip status={booking.status} label={t(statusKey[booking.status] ?? 'statusPending')} />
+      </div>
+
+      <Panel>
+        <h2 className="text-xl font-bold text-brand-900">
+          {booking.listings?.title ?? '—'}
+        </h2>
+        <dl className="mt-3 space-y-2 text-base">
+          <div className="flex justify-between gap-4">
+            <dt className="font-semibold text-brand-900">{t('providerLabel')}</dt>
+            <dd className="text-brand-800">
+              {booking.providers?.business_name ?? '—'}
+            </dd>
+          </div>
+          <div className="flex justify-between gap-4">
+            <dt className="font-semibold text-brand-900">{t('customerLabel')}</dt>
+            <dd className="text-brand-800">
+              {booking.customer?.display_name ?? '—'}
+            </dd>
+          </div>
+          <div className="flex justify-between gap-4">
+            <dt className="font-semibold text-brand-900">{t('scheduledFor')}</dt>
+            <dd className="text-brand-800">
+              {booking.scheduled_at
+                ? new Date(booking.scheduled_at).toLocaleString(locale, {
+                    dateStyle: 'medium',
+                    timeStyle: 'short',
+                  })
+                : t('scheduledFlexible')}
+            </dd>
+          </div>
+          <div className="flex justify-between gap-4">
+            <dt className="font-semibold text-brand-900">{t('requestedOn')}</dt>
+            <dd className="text-brand-800">
+              {new Date(booking.created_at).toLocaleString(locale, {
+                dateStyle: 'medium',
+                timeStyle: 'short',
+              })}
+            </dd>
+          </div>
+          {booking.agreed_price_cents != null ? (
+            <div className="flex justify-between gap-4">
+              <dt className="font-semibold text-brand-900">
+                {t('agreedPriceLabel')}
+              </dt>
+              <dd className="text-lg font-bold text-green-700">
+                {formatCurrency(booking.agreed_price_cents, priceCurrency, locale)}
+              </dd>
+            </div>
+          ) : null}
+          {/* Platform fee breakdown — DORMANT booking-model surface
+              (MAJ-1, Oct 20, 2026): renders ONLY when SERVICE_BOOKING_LIVE
+              is on. Under the connector model Zervia charges no per-job
+              platform fee, so this block — and its fee strings — must
+              never appear while booking is gated off. If booking is ever
+              re-enabled through the documented re-entry gate, the fee
+              model in lib/pricing.ts is the single source to re-approve. */}
+          {bookingLive && role === 'provider' && payableAmount != null && payableAmount > 0 ? (
+            <>
+              <div className="flex justify-between gap-4">
+                <dt className="font-semibold text-brand-900">
+                  {t('platformFeeLabel', { percent: feeBps / 100 })}
+                </dt>
+                <dd className="text-brand-800">
+                  −{formatCurrency(feeCents, priceCurrency, locale)}
+                </dd>
+              </div>
+              <div className="flex justify-between gap-4">
+                <dt className="font-semibold text-brand-900">
+                  {t('youKeepLabel')}
+                </dt>
+                <dd className="text-lg font-bold text-green-700">
+                  {formatCurrency(netCents, priceCurrency, locale)}
+                </dd>
+              </div>
+              {!providerIsMember ? (
+                <p className="text-sm text-brand-600">
+                  {t('memberFeeHint', { percent: 5 })}
+                </p>
+              ) : null}
+              {providerIsAudited ? (
+                <p className="text-sm font-semibold text-amber-700">
+                  🏅 {t('auditedFeeHint')}
+                </p>
+              ) : (
+                <p className="text-sm text-brand-600">
+                  {t('auditFeeHint', { percent: providerIsMember ? 4 : 8 })}
+                </p>
+              )}
+            </>
+          ) : null}
+        </dl>
+        {booking.notes ? (
+          <div className="mt-3">
+            <p className="font-semibold text-brand-900">{t('notesTitle')}</p>
+            <p className="mt-1 whitespace-pre-wrap text-base text-brand-800">
+              {booking.notes}
+            </p>
+          </div>
+        ) : null}
+      </Panel>
+
+      {/* Status timeline */}
+      <Panel>
+        <ol className="space-y-2">
+          {timeline.map((step) => (
+            <li key={step.key} className="flex items-center gap-3 text-base">
+              <span
+                aria-hidden="true"
+                className={`flex h-8 w-8 items-center justify-center rounded-full text-sm font-bold ${
+                  step.done
+                    ? 'bg-brand-600 text-white'
+                    : 'bg-brand-100 text-brand-400'
+                }`}
+              >
+                {step.done ? '✓' : '·'}
+              </span>
+              <span
+                className={
+                  step.done
+                    ? 'font-semibold text-brand-900'
+                    : 'text-brand-400'
+                }
+              >
+                {t(step.key)}
+              </span>
+            </li>
+          ))}
+          {booking.status === 'cancelled' ? (
+            <li className="flex items-center gap-3 text-base">
+              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-gray-200 text-sm font-bold text-gray-600">
+                ✕
+              </span>
+              <span className="font-semibold text-gray-600">
+                {t('timelineCancelled')}
+              </span>
+            </li>
+          ) : null}
+          {booking.status === 'disputed' ? (
+            <li className="flex items-center gap-3 text-base">
+              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-red-200 text-sm font-bold text-red-700">
+                !
+              </span>
+              <span className="font-semibold text-red-700">
+                {t('timelineDisputed')}
+              </span>
+            </li>
+          ) : null}
+        </ol>
+      </Panel>
+
+      {/* Dispute context */}
+      {booking.status === 'disputed' && booking.dispute_reason ? (
+        <Panel>
+          <p className="font-semibold text-brand-900">{t('disputeReason')}</p>
+          <p className="mt-1 whitespace-pre-wrap text-base text-brand-800">
+            {booking.dispute_reason}
+          </p>
+        </Panel>
+      ) : null}
+
+      {/* Actions */}
+      {bookingLive ? (
+      <BookingActions
+        bookingId={booking.id}
+        role={role}
+        status={booking.status}
+        releaseAmount={payableAmount}
+        releaseCurrency={priceCurrency}
+      />
+      ) : null}
+
+      {/* Held-payment panel (dormant booking model only) */}
+      {bookingLive && (isCustomer || isProvider) ? (
+        <SectionErrorBoundary>
+        <PaymentPanel
+          bookingId={booking.id}
+          role={role}
+          status={booking.status}
+          escrowStatus={escrow?.status ?? null}
+          amountCents={escrow?.amount_cents ?? payableAmount}
+          amountCurrency={escrow ? escrowCurrency : priceCurrency}
+          canPay={canPay}
+          walletsReady={process.env.STRIPE_WALLETS_ENABLED === 'true'}
+          testMode={isStripeTestMode()}
+        />
+        </SectionErrorBoundary>
+      ) : null}
+
+      {/* Admin dispute mediation: release or refund the held payment */}
+      {bookingLive && isAdmin === true && booking.status === 'disputed' ? (
+        <DisputeResolutionPanel
+          bookingId={booking.id}
+          escrowStatus={escrow?.status ?? null}
+        />
+      ) : null}
+
+      {/* 48-hour rework request */}
+      {bookingLive && showRework ? <ReworkForm bookingId={booking.id} /> : null}
+
+      {/* Quotes */}
+      {quotes && quotes.length > 0 ? (
+        <div className="space-y-3">
+          {quotes.map((q) => (
+            <QuoteCard
+              key={q.id}
+              quote={q}
+              role={role}
+              locale={locale}
+              currency={priceCurrency}
+            />
+          ))}
+        </div>
+      ) : null}
+
+      {/* Provider quote composer (while the job is being arranged). */}
+      {bookingLive && role === 'provider' &&
+      ['pending', 'confirmed'].includes(booking.status) ? (
+        <QuoteForm bookingId={booking.id} />
+      ) : null}
+
+      {/* Booking chat thread */}
+      {['pending', 'confirmed', 'in_progress', 'completed', 'disputed'].includes(
+        booking.status
+      ) ? (
+        <SectionErrorBoundary>
+        <BookingChat
+          bookingId={booking.id}
+          initialMessages={messages ?? []}
+          currentUserId={user.id}
+          counterpartyName={counterpartyName}
+          isProvider={role === 'provider'}
+        />
+        </SectionErrorBoundary>
+      ) : null}
+
+      {canDispute ? (
+        <Link
+          href={`/app/bookings/${booking.id}/dispute`}
+          className="inline-flex min-h-[44px] items-center text-base font-semibold text-red-700 underline"
+        >
+          {t('disputeTitle')}
+        </Link>
+      ) : null}
+
+      {/* REQUIRED post-service survey: the primary CTA after completion.
+          The optional public review link stays below, but the survey comes
+          first and is rendered inline (not just a link). */}
+      {canSurvey ? (
+        <Panel>
+          <p className="text-sm font-semibold uppercase tracking-wide text-brand-500">
+            {t('surveyTitle')}
+          </p>
+          <p className="mt-1 text-base font-medium text-brand-800">
+            {t('surveyRequired')}
+          </p>
+          <p className="mt-1 text-sm text-brand-600">{t('surveyDescription')}</p>
+          <div className="mt-4">
+            <PostServiceSurvey bookingId={booking.id} />
+          </div>
+        </Panel>
+      ) : null}
+      {isCustomer && booking.status === 'completed' && survey ? (
+        <p className="text-base font-medium text-green-700">
+          ✓ {t('surveyCompletedNote')}
+        </p>
+      ) : null}
+
+      {/* Review */}
+      {canReview ? (
+        <Link
+          href={`/app/bookings/${booking.id}/review`}
+          className="inline-flex min-h-[56px] items-center justify-center rounded-full bg-amber-400 px-8 text-base font-bold text-brand-900 hover:bg-amber-500"
+        >
+          ⭐ {t('leaveReview')}
+        </Link>
+      ) : null}
+      {/* One-tap re-contact: completed jobs can reach the same
+          provider/service again via the listing's connect options
+          (connector model — Zervia takes no booking). */}
+      {isCustomer && booking.status === 'completed' && booking.listing_id ? (
+        <Link
+          href={`/listings/${booking.listing_id}`}
+          className="inline-flex min-h-[56px] items-center justify-center rounded-full bg-brand-600 px-8 text-base font-semibold text-white hover:bg-brand-700"
+        >
+          🔁 {t('bookAgain')}
+        </Link>
+      ) : null}
+      {/* Provider nudge: ask the customer for a review (one nudge max). */}
+      {isProvider &&
+      booking.status === 'completed' &&
+      !review &&
+      !booking.review_requested_at ? (
+        <RequestReviewButton bookingId={booking.id} locale={locale} />
+      ) : null}
+      {isProvider &&
+      booking.status === 'completed' &&
+      !review &&
+      booking.review_requested_at ? (
+        <p className="text-base font-medium text-brand-600">
+          ✓ {t('reviewRequestSentNote')}
+        </p>
+      ) : null}
+      {review ? (
+        <Panel>
+          <p className="text-sm font-semibold uppercase tracking-wide text-brand-500">
+            {isCustomer ? t('reviewByYou') : t('reviewsTitle')}
+          </p>
+          <p
+            className="mt-1 text-lg font-bold text-brand-900"
+            aria-label={t('stars', { count: review.rating })}
+          >
+            {'⭐'.repeat(Math.max(0, Math.min(5, Math.round(review.rating ?? 0))))}
+            <span className="sr-only">{t('stars', { count: review.rating })}</span>
+          </p>
+          {review.text ? (
+            <p className="mt-2 whitespace-pre-wrap text-base text-brand-800">
+              {review.text}
+            </p>
+          ) : null}
+        </Panel>
+      ) : null}
+    </div>
+    </SectionErrorBoundary>
+  );
+}
