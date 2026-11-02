@@ -1,0 +1,161 @@
+@import "tailwindcss";
+
+@theme {
+  /* Zervia brand blue scale — blue-and-white identity. */
+  --color-brand-50: #eef5ff;
+  --color-brand-100: #d9e8ff;
+  --color-brand-200: #b3d1ff;
+  --color-brand-300: #80b3ff;
+  --color-brand-400: #4d8dff;
+  --color-brand-500: #2470f2;
+  --color-brand-600: #0b5bd3;
+  --color-brand-700: #0a4aa8;
+  --color-brand-800: #0d3c83;
+  --color-brand-900: #0e2f61;
+  --color-brand-950: #0a1f42;
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: #ffffff;
+  color: #0f172a; /* slate-900 */
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Shared auth input: 56px tap target, brand focus ring, senior-friendly. */
+.auth-input {
+  min-height: 56px;
+  width: 100%;
+  border-radius: 1rem;
+  border: 2px solid var(--color-brand-100);
+  background-color: #ffffff;
+  padding: 0.75rem 1.25rem;
+  font-size: 1.125rem;
+  color: var(--color-brand-900);
+}
+.auth-input::placeholder {
+  color: #94a3b8; /* slate-400 */
+}
+.auth-input:focus {
+  outline: none;
+  border-color: var(--color-brand-600);
+  box-shadow: 0 0 0 3px var(--color-brand-100);
+}
+
+/* Accessibility (Batch 2, Oct 2026): skip link, reduced motion,
+   placeholder contrast >= 4.5:1 on white. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  background: var(--color-brand-700);
+  color: #ffffff;
+  padding: 0.75rem 1.25rem;
+  border-radius: 0 0 1rem 0;
+  font-weight: 600;
+}
+.skip-link:focus {
+  left: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+.auth-input::placeholder {
+  color: #475569; /* slate-600 — 7.5:1 on white */
+}
+::placeholder {
+  color: #475569;
+  opacity: 1;
+}
+
+/* ── Widget de-congestion (Oct 20, 2026 rev 2 — supersedes the Z3 rules
+   from the live-test batch below it in git history) ───────────────────
+   Liz's screenshot: on a wider-than-640px screen the Tidio bubble AND
+   its "Chat with us 👋" teaser pill sat directly on the Install
+   prompt's Install / Not now buttons. The old rules only applied at
+   ≤640px, so tablets and wide phones got the full-size bubble with no
+   separation at all. Separation strategy — one bottom element at a
+   time, each with its own zone:
+   1. Launcher shrunk at EVERY width (0.85; 0.78 on small phones).
+   2. Our bottom bars (cookie, install) always sit in a clear zone
+      ABOVE the chat zone (bubble + teaser occupy roughly the bottom
+      20–88px on the right) — at every width, not just ≤640px.
+   3. On ≥900px the install card docks bottom-LEFT instead (chat stays
+      bottom-right): opposite corners, back at the natural bottom.
+   4. Cookie choice comes first: while the cookie bar is up, the
+      install card waits hidden; it appears once the cookie bar is
+      dismissed (pure CSS — :has() stops matching). No more stacking
+      of all three at once.
+   5. While the chat panel is OPEN (html.tidio-chat-open, toggled from
+      Tidio's open/close events in the locale layout) the bars step
+      aside completely and the widget un-shrinks and rises above them —
+      the chat typing box can never be covered (the old Z8 class). */
+#tidio-chat,
+#tidio-chat iframe {
+  z-index: 30 !important; /* below cookie banner (50), modals (60+) */
+}
+#tidio-chat iframe {
+  transform: scale(0.85);
+  transform-origin: bottom right;
+}
+@media (max-width: 640px) {
+  #tidio-chat iframe {
+    transform: scale(0.78);
+  }
+}
+.cookie-banner-bar {
+  bottom: 96px !important; /* above the chat zone, never under it */
+}
+.install-prompt-bar {
+  bottom: 104px !important; /* above the chat zone, never under it */
+}
+@media (min-width: 900px) {
+  .install-prompt-bar {
+    bottom: 16px !important; /* docked left, opposite the chat bubble */
+    right: auto !important;
+    width: min(430px, calc(100vw - 32px));
+  }
+}
+body:has(.cookie-banner-bar) .install-prompt-bar {
+  display: none !important; /* cookie first, install after — never both */
+}
+html.tidio-chat-open #tidio-chat,
+html.tidio-chat-open #tidio-chat iframe {
+  z-index: 80 !important; /* open panel above bars/modals while in use */
+}
+html.tidio-chat-open #tidio-chat iframe {
+  transform: none !important; /* full-size panel, no launcher shrink */
+}
+html.tidio-chat-open .cookie-banner-bar,
+html.tidio-chat-open .install-prompt-bar {
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+/* Visual date picker (Z1): our own calendar button opens the picker,
+   so hide the cramped native indicator to avoid a double control. */
+.visual-date-input::-webkit-calendar-picker-indicator {
+  opacity: 0;
+  position: absolute;
+  right: 0;
+  width: 3.5rem;
+  height: 100%;
+  cursor: pointer;
+}
